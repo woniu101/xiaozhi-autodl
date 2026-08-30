@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source_dir=/root/xiaozhi-esp32-server/main/manager-api
+target=/root/xiaozhi-autodl/artifacts/manager-api/xiaozhi-esp32-api.jar
+previous=/root/xiaozhi-autodl/artifacts/manager-api/xiaozhi-esp32-api.previous.jar
+cd "$source_dir"
+mvn -Dmaven.test.skip=true package
+jar=$(find target -maxdepth 1 -type f -name '*.jar' ! -name '*.original' ! -name 'original-*' -printf '%p\n' | sort | head -1)
+test -n "$jar" || { echo '未找到 manager-api JAR' >&2; exit 1; }
+install -m 0644 "$jar" "${target}.next"
+if [[ -f "$target" ]]; then
+  mv -f "$target" "$previous"
+fi
+mv "${target}.next" "$target"
+echo "manager-api 已原子替换到 $target（上一版本保留为 .previous.jar）"

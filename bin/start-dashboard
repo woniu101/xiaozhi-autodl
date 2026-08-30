@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+source /root/xiaozhi-autodl/config/defaults.env
+set +a
+exec /usr/bin/node /root/xiaozhi-autodl/dashboard/dist/server/index.js

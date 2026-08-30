@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -u
+failed=0
+check() {
+  local name=$1 url=$2
+  if curl --noproxy '*' -fsS --max-time 3 "$url" >/dev/null; then printf '%-20s OK\n' "$name"; else printf '%-20s FAIL\n' "$name"; failed=1; fi
+}
+check dashboard http://127.0.0.1:6006/api/health
+check manager-web http://127.0.0.1:6008/
+check manager-api http://127.0.0.1:8002/xiaozhi/user/pub-config
+check index-tts http://127.0.0.1:8092/health/ready
+exit "$failed"

@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=/root/xiaozhi-autodl
+runtime=/root/autodl-tmp/xiaozhi-autodl
+supervisor_config="$root/config/supervisor/supervisord.conf"
+supervisorctl=/root/miniconda3/bin/supervisorctl
+valid=(dashboard manager-web manager-api xiaozhi-server index-tts)
+
+usage() {
+  echo "用法: $0 [all|dashboard|manager-web|manager-api|xiaozhi-server|index-tts]..."
+}
+
+requested=("$@")
+if (( ${#requested[@]} == 0 )); then requested=(all); fi
+
+declare -A selected=()
+for component in "${requested[@]}"; do
+  if [[ "$component" == all ]]; then
+    for item in "${valid[@]}"; do selected["$item"]=1; done
+    continue
+  fi
+  known=0
+  for item in "${valid[@]}"; do
+    if [[ "$component" == "$item" ]]; then known=1; break; fi
+  done
+  if (( ! known )); then
+    echo "不支持的组件: $component" >&2
+    usage >&2
+    exit 2
+  fi
+  selected["$component"]=1
+done
+
+components=()
+for item in "${valid[@]}"; do
+  [[ ${selected[$item]:-0} == 1 ]] && components+=("$item")
+done
+
+"$root/bin/first-boot"
+if ! "$supervisorctl" -c "$supervisor_config" pid >/dev/null 2>&1; then
+  echo "Supervisor 未运行，请先执行 $root/bin/suite-start" >&2
+  exit 1
+fi
+
+programs=(dashboard web-gateway manager-api xiaozhi-server index-tts)
+declare -A original=()
+for program in "${programs[@]}"; do
+  original["$program"]=$("$supervisorctl" -c "$supervisor_config" status "$program" 2>/dev/null | awk '{print $2}' || true)
+done
+
+was_active() {
+  [[ "$1" == RUNNING || "$1" == STARTING ]]
+}
+
+mysql_running=0
+redis_running=0
+service mysql status >/dev/null 2>&1 && mysql_running=1
+service redis-server status >/dev/null 2>&1 && redis_running=1
+paused=()
+db_paused=0
+finished=0
+
+restore_original_runtime() {
+  if (( db_paused )); then
+    (( mysql_running )) && service mysql start >/dev/null
+    (( redis_running )) && service redis-server start >/dev/null
+    db_paused=0
+  fi
+  for program in "${paused[@]}"; do
+    if was_active "${original[$program]}"; then
+      "$supervisorctl" -c "$supervisor_config" start "$program" >/dev/null || true
+    fi
+  done
+  paused=()
+}
+
+finish_guard() {
+  status=$?
+  if (( ! finished )); then
+    echo "刷新未完成，正在恢复刷新前运行状态" >&2
+    restore_original_runtime
+  fi
+  exit "$status"
+}
+trap finish_guard EXIT
+
+memory_max=max
+[[ -r /sys/fs/cgroup/memory.max ]] && memory_max=$(< /sys/fs/cgroup/memory.max)
+needs_heavy_build=0
+[[ ${selected[manager-web]:-0} == 1 || ${selected[manager-api]:-0} == 1 ]] && needs_heavy_build=1
+if (( needs_heavy_build )) && [[ "$memory_max" =~ ^[0-9]+$ ]] && (( memory_max <= 4 * 1024 * 1024 * 1024 )); then
+  echo "检测到低内存配额，构建期间临时释放 Java/Python/MySQL/Redis 内存"
+  for program in index-tts xiaozhi-server manager-api; do
+    if was_active "${original[$program]}"; then
+      "$supervisorctl" -c "$supervisor_config" stop "$program" >/dev/null
+      paused+=("$program")
+    fi
+  done
+  (( mysql_running )) && service mysql stop >/dev/null
+  (( redis_running )) && service redis-server stop >/dev/null
+  db_paused=1
+fi
+
+[[ ${selected[manager-web]:-0} == 1 ]] && "$root/scripts/build-manager-web"
+[[ ${selected[manager-api]:-0} == 1 ]] && "$root/scripts/build-manager-api"
+[[ ${selected[dashboard]:-0} == 1 ]] && "$root/scripts/build-dashboard"
+
+if (( db_paused )); then
+  (( mysql_running )) && service mysql start >/dev/null
+  (( redis_running )) && service redis-server start >/dev/null
+  db_paused=0
+fi
+
+"$supervisorctl" -c "$supervisor_config" reread >/dev/null
+"$supervisorctl" -c "$supervisor_config" update >/dev/null
+
+declare -A target_for=(
+  [dashboard]=dashboard
+  [manager-web]=web-gateway
+  [manager-api]=manager-api
+  [xiaozhi-server]=xiaozhi-server
+  [index-tts]=index-tts
+)
+for component in "${components[@]}"; do
+  program=${target_for[$component]}
+  if was_active "${original[$program]}"; then
+    echo "重启 $program 以加载当前源码/产物"
+    "$supervisorctl" -c "$supervisor_config" restart "$program" >/dev/null
+  else
+    echo "$program 刷新完成；保持刷新前的停止状态"
+  fi
+done
+
+for program in "${paused[@]}"; do
+  restore=1
+  for component in "${components[@]}"; do
+    [[ ${target_for[$component]} == "$program" ]] && restore=0
+  done
+  if (( restore )) && was_active "${original[$program]}"; then
+    "$supervisorctl" -c "$supervisor_config" start "$program" >/dev/null
+  fi
+done
+paused=()
+
+component_json=
+for component in "${components[@]}"; do
+  [[ -n "$component_json" ]] && component_json+=,
+  component_json+="\"$component\""
+done
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"refreshedAt":"%s","components":[%s]}\n' "$timestamp" "$component_json" > "$runtime/run/last-refresh.json"
+chmod 0644 "$runtime/run/last-refresh.json"
+
+finished=1
+trap - EXIT
+echo "运行版本刷新完成: ${components[*]}"
+"$supervisorctl" -c "$supervisor_config" status || true

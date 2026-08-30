@@ -1,0 +1,43 @@
+# Runtime data and logs
+logs/
+*.log
+*.log.*
+run/
+secrets/
+uploads/
+outputs/
+
+# Generated build artifacts
+artifacts/
+dashboard/dist/
+
+# Installed dependencies and caches
+dashboard/node_modules/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.vite/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.session
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.tmp
+*.swp
+*.swo
+*.bak
+*~

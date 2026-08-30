@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=/root/xiaozhi-autodl
+supervisor_config="$root/config/supervisor/supervisord.conf"
+
+"$root/bin/first-boot"
+/usr/sbin/service mysql start
+/usr/sbin/service redis-server start
+
+if /root/miniconda3/bin/supervisorctl -c "$supervisor_config" pid >/dev/null 2>&1; then
+  /root/miniconda3/bin/supervisorctl -c "$supervisor_config" reread
+  /root/miniconda3/bin/supervisorctl -c "$supervisor_config" update
+  /root/miniconda3/bin/supervisorctl -c "$supervisor_config" start all || true
+else
+  /root/miniconda3/bin/supervisord -c "$supervisor_config"
+fi
+
+/root/miniconda3/bin/supervisorctl -c "$supervisor_config" status

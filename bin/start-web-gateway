@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+test -f /root/xiaozhi-autodl/artifacts/manager-web/index.html || { echo 'manager-web 尚未构建，请运行 scripts/build-manager-web' >&2; exit 1; }
+exec /usr/sbin/nginx -c /root/xiaozhi-autodl/config/nginx/nginx.conf -g 'daemon off;'

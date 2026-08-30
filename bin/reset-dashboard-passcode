@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+secret=/root/autodl-tmp/xiaozhi-autodl/secrets/dashboard.json
+supervisor_config=/root/xiaozhi-autodl/config/supervisor/supervisord.conf
+
+if [[ -f "$secret" ]]; then
+  backup="${secret}.reset-$(date -u +%Y%m%dT%H%M%SZ)"
+  mv -- "$secret" "$backup"
+  chmod 0600 "$backup"
+  echo "旧认证文件已备份到: $backup"
+fi
+
+if /root/miniconda3/bin/supervisorctl -c "$supervisor_config" pid >/dev/null 2>&1; then
+  /root/miniconda3/bin/supervisorctl -c "$supervisor_config" restart dashboard
+  echo 'Dashboard 已重启，请在网页中创建新的运维口令。'
+else
+  echo 'Supervisor 未运行；下次启动 Dashboard 时将进入创建口令页面。'
+fi

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -a
+source /root/xiaozhi-autodl/config/defaults.env
+set +a
+# 每次启动都按容器实际可用 CPU 自动计算，不继承父环境中的非法 OMP_NUM_THREADS。
+threads=$(nproc)
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+  read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+  if [[ "$cpu_quota" != max ]] && [[ "$cpu_quota" =~ ^[0-9]+$ ]] && [[ "$cpu_period" =~ ^[0-9]+$ ]] && (( cpu_period > 0 )); then
+    quota_threads=$(( (cpu_quota + cpu_period - 1) / cpu_period ))
+    (( quota_threads < threads )) && threads=$quota_threads
+  fi
+fi
+(( threads < 1 )) && threads=1
+
+export INDEXTTS_CPU_THREADS="$threads"
+export OMP_NUM_THREADS="$threads"
+export MKL_NUM_THREADS="$threads"
+export OPENBLAS_NUM_THREADS="$threads"
+export NUMEXPR_NUM_THREADS="$threads"
+export OMP_DYNAMIC=FALSE
+export OMP_PROC_BIND=spread
+export OMP_PLACES=cores
+export TOKENIZERS_PARALLELISM=false
+export PYTHONPATH=/root/xiaozhi-autodl:/root/index-tts
+
+echo "IndexTTS CPU threads: $threads"
+cd /root/index-tts
+exec /usr/bin/nice -n 5 /root/miniconda3/envs/indextts25/bin/python -m uvicorn integrations.index_tts_observer:app --host "${INDEXTTS_HOST:-0.0.0.0}" --port "${INDEXTTS_PORT:-8092}" --workers 1

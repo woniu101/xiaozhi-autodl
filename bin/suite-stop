@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+config=/root/xiaozhi-autodl/config/supervisor/supervisord.conf
+if /root/miniconda3/bin/supervisorctl -c "$config" pid >/dev/null 2>&1; then
+  /root/miniconda3/bin/supervisorctl -c "$config" stop all || true
+  /root/miniconda3/bin/supervisorctl -c "$config" shutdown || true
+fi

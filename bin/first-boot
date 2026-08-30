@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+runtime_root=/root/autodl-tmp/xiaozhi-autodl
+install -d -m 0755 "$runtime_root" "$runtime_root/config" "$runtime_root/logs" "$runtime_root/run" "$runtime_root/uploads" "$runtime_root/voices"
+install -d -m 0700 "$runtime_root/secrets"
+
+if [[ ! -e "$runtime_root/config/endpoints.json" ]]; then
+  umask 077
+  printf '%s\n' '{"mode":"autodl","sshPort":22,"localPort":16008}' > "$runtime_root/config/endpoints.json"
+fi

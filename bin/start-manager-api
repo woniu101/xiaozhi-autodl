@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+jar=/root/xiaozhi-autodl/artifacts/manager-api/xiaozhi-esp32-api.jar
+test -f "$jar" || { echo 'manager-api 尚未构建，请运行 scripts/build-manager-api' >&2; exit 1; }
+
+for port in 3306 6379; do
+  for _ in $(seq 1 60); do
+    if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null || { echo "依赖端口 $port 未就绪" >&2; exit 1; }
+done
+
+export CHARACTER_STYLE_DIR=/root/xiaozhi-esp32-server/main/xiaozhi-server/data/character_styles
+exec /usr/bin/java -Xms256m -Xmx1536m -jar "$jar" --spring.profiles.active=dev --server.address=127.0.0.1

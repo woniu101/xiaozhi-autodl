@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source_dir=/root/xiaozhi-esp32-server/main/manager-web
+target_dir=/root/xiaozhi-autodl/artifacts/manager-web
+artifact_root=/root/xiaozhi-autodl/artifacts
+previous_dir=/root/xiaozhi-autodl/artifacts/manager-web.previous
+cd "$source_dir"
+heap_mb=1500
+if [[ -r /sys/fs/cgroup/memory.max ]]; then
+  memory_max=$(< /sys/fs/cgroup/memory.max)
+  if [[ "$memory_max" =~ ^[0-9]+$ ]] && (( memory_max <= 3 * 1024 * 1024 * 1024 )); then
+    heap_mb=900
+  fi
+fi
+export NODE_OPTIONS="--max-old-space-size=${heap_mb} --require=/root/xiaozhi-autodl/scripts/limit-build-cpu.cjs"
+echo "manager-web 构建内存上限: ${heap_mb} MiB"
+npm run build
+
+install -d -m 0755 "$artifact_root"
+staging=$(mktemp -d "$artifact_root/.manager-web.next.XXXXXX")
+cleanup() {
+  if [[ -d "$staging" ]]; then
+    find "$staging" -mindepth 1 -delete
+    rmdir "$staging"
+  fi
+}
+trap cleanup EXIT
+cp -a dist/. "$staging/"
+
+if [[ -d "$previous_dir" ]]; then
+  find "$previous_dir" -mindepth 1 -delete
+  rmdir "$previous_dir"
+fi
+if [[ -d "$target_dir" ]]; then
+  mv "$target_dir" "$previous_dir"
+fi
+mv "$staging" "$target_dir"
+trap - EXIT
+echo "manager-web 已原子替换到 $target_dir（上一版本保留在 manager-web.previous）"
