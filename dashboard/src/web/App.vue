@@ -92,6 +92,8 @@ type UpdateOperation = {
   repository: string
   state: 'running' | 'done' | 'failed' | 'rolled-back'
   message?: string
+  fromCommit?: string
+  toCommit?: string
   components?: string[]
   steps: Array<{ name: string; label: string; state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'; message?: string }>
   logs: string[]
@@ -971,7 +973,7 @@ onBeforeUnmount(() => {
       </section>
 
       <section v-if="versionState" class="repository-grid">
-        <article v-for="repository in versionState.repositories" :id="`repository-${repository.key}`" :key="repository.key" :class="['repository-card', { 'self-repository': repository.key === 'xiaozhi-autodl' }]">
+        <article v-for="repository in versionState.repositories" :id="`repository-${repository.key}`" :key="repository.key" :class="['repository-card', { 'self-repository': repository.key === 'xiaozhi-autodl', 'has-update-detail': updateOperation?.repository === repository.key }]">
           <header>
             <div><span class="repository-icon">{{ repository.key === 'xiaozhi' ? 'X' : repository.key === 'index-tts' ? 'I' : 'A' }}</span><div><h2>{{ repository.label }}</h2><a v-if="repository.remoteUrl" :href="repository.remoteUrl" target="_blank">{{ repository.remoteUrl }} ↗</a></div></div>
             <span :class="['remote-status', remoteVersionTone(repository)]"><i></i>{{ remoteVersionLabel(repository) }}</span>
@@ -1018,13 +1020,19 @@ onBeforeUnmount(() => {
               <button class="primary" :disabled="busy || !repository.updateAvailable || repository.updateBlocked || repository.dependencyBlocked || repository.canFastForward === false || updateOperation?.state === 'running'" :title="repository.blockingChanges?.join('\n')" @click="requestSafeUpdate(repository)">{{ repository.dependencyBlocked ? '需要升级环境' : repository.updateAvailable ? repository.key === 'xiaozhi-autodl' ? '安全更新并重启 Dashboard' : '安全更新并刷新服务' : '已是最新版本' }}</button>
             </div>
           </footer>
-        </article>
-      </section>
 
-      <section v-if="updateOperation" :class="['update-detail', updateOperation.state]">
-        <header><div><h2>{{ updateOperation.state === 'running' ? '安全更新执行中' : updateOperation.state === 'done' ? '安全更新完成' : updateOperation.state === 'rolled-back' ? '更新失败，已自动回滚' : '安全更新失败' }}</h2><p>{{ updateOperation.message || '正在执行受保护更新流程' }}</p></div><code>{{ updateOperation.repository }} · {{ updateOperation.id.slice(0, 8) }}</code></header>
-        <ol><li v-for="step in updateOperation.steps" :key="step.name" :class="step.state"><i></i><span>{{ step.label }}</span><small>{{ step.message }}</small></li></ol>
-        <pre>{{ updateOperation.logs.join('\n') || '等待更新日志…' }}</pre>
+          <section v-if="updateOperation?.repository === repository.key" :class="['update-detail', updateOperation.state]">
+            <header>
+              <div>
+                <h2>{{ repository.label }} · {{ updateOperation.state === 'running' ? '安全更新执行中' : updateOperation.state === 'done' ? '安全更新完成' : updateOperation.state === 'rolled-back' ? '更新失败，已自动回滚' : '安全更新失败' }}</h2>
+                <p>{{ updateOperation.message || '正在执行受保护更新流程' }}</p>
+              </div>
+              <code>{{ updateOperation.fromCommit || '当前版本' }} → {{ updateOperation.toCommit || '远端版本' }}</code>
+            </header>
+            <ol><li v-for="step in updateOperation.steps" :key="step.name" :class="step.state"><i></i><span>{{ step.label }}</span><small>{{ step.message }}</small></li></ol>
+            <pre>{{ updateOperation.logs.join('\n') || '等待更新日志…' }}</pre>
+          </section>
+        </article>
       </section>
     </main>
 
