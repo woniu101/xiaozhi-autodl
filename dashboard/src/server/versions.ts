@@ -3,11 +3,12 @@ import { resolve } from 'node:path'
 import { RUNTIME_ROOT } from './config.js'
 import { run, type CommandResult } from './process.js'
 
-export type RepositoryKey = 'xiaozhi' | 'index-tts'
+export type RepositoryKey = 'xiaozhi' | 'index-tts' | 'xiaozhi-autodl'
 
 export const REPOSITORIES: Record<RepositoryKey, { label: string; path: string; deployBranch: string }> = {
   xiaozhi: { label: 'xiaozhi-esp32-server', path: '/root/xiaozhi-esp32-server', deployBranch: 'mvp' },
   'index-tts': { label: 'index-tts', path: '/root/index-tts', deployBranch: 'main' },
+  'xiaozhi-autodl': { label: 'xiaozhi-autodl', path: '/root/xiaozhi-autodl', deployBranch: 'main' },
 }
 
 const checkRecordPath = resolve(RUNTIME_ROOT, 'run/version-check.json')
@@ -71,6 +72,7 @@ export async function fetchDeploymentBranch(key: RepositoryKey, onAttempt?: (att
 export function affectedComponentsForFiles(key: RepositoryKey, files: string[]): string[] {
   const documentation = /^(?:README(?:\.[^/]*)?|LICENSE(?:\.[^/]*)?|docs\/|\.github\/)/i
   if (key === 'index-tts') return files.some((file) => !documentation.test(file)) ? ['index-tts'] : []
+  if (key === 'xiaozhi-autodl') return files.length ? ['dashboard'] : []
   const selected = new Set<string>()
   for (const file of files) {
     if (file.startsWith('main/manager-web/')) selected.add('manager-web')
@@ -139,7 +141,9 @@ export async function repositoryState(key: RepositoryKey) {
         /^main\/manager-web\/(?:package|package-lock)\.json$/,
         /^main\/manager-api\/(?:pom\.xml|\.mvn\/|mvnw)/,
       ]
-    : [/^(?:pyproject\.toml|uv\.lock|requirements.*\.txt)$/]
+    : key === 'index-tts'
+      ? [/^(?:pyproject\.toml|uv\.lock|requirements.*\.txt)$/]
+      : [/^(?:environment.*\.ya?ml|requirements.*\.txt)$/]
   const dependencyChanges = changedFiles.filter((file) => dependencyPatterns.some((pattern) => pattern.test(file)))
   const affectedComponents = affectedComponentsForFiles(key, changedFiles)
   const refs = [deployRef]

@@ -1,6 +1,6 @@
 {
   "name": "xiaozhi-autodl-dashboard",
-  "version": "0.6.2",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "build:web": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "start": "node dist/server/index.js",
+    "test": "npm run build:server && node --test dist/server/*.test.js",
     "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
   },
   "dependencies": {

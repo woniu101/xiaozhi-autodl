@@ -5,10 +5,20 @@ import { RUNTIME_ROOT, SERVICES, SUPERVISOR_CONFIG, type ServiceAction, type Ser
 import { run } from './process.js'
 import { observeStability, serviceSignals } from './service-metrics.js'
 
-export type ServicePhase = 'READY' | 'STARTING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
+export type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
 export type LogLevel = 'all' | 'info' | 'warn' | 'error'
 export type LogSource = 'service' | 'access' | 'error'
 export type LogPreset = 'http-errors' | 'manager-requests'
+
+export interface ServiceActions {
+  start: boolean
+  stop: boolean
+  restart: boolean
+}
+
+export class ServiceOperationConflict extends Error {}
+
+const activeActions = new Map<ServiceName, ServiceAction>()
 
 const startOrder: ServiceName[] = ['mysql', 'redis', 'manager-api', 'index-tts', 'xiaozhi-server', 'web-gateway']
 const stopOrder = [...startOrder].reverse()
@@ -44,6 +54,29 @@ async function systemServicePid(name: 'mysql' | 'redis'): Promise<number | undef
     if (result.code === 0 && Number.isInteger(pid) && pid > 0) return pid
   }
   return undefined
+}
+
+async function systemServiceHealthy(name: 'mysql' | 'redis'): Promise<boolean> {
+  const result = name === 'redis'
+    ? await run('/usr/bin/redis-cli', ['--raw', 'PING'], 2_000)
+    : await run('/usr/bin/mysqladmin', ['--defaults-file=/etc/mysql/debian.cnf', 'ping'], 2_000)
+  return result.code === 0 && (name === 'redis' ? result.stdout.trim() === 'PONG' : /mysqld is alive/i.test(result.stdout))
+}
+
+async function systemServiceRunning(name: 'mysql' | 'redis'): Promise<boolean> {
+  const [healthy, pid, listening] = await Promise.all([
+    systemServiceHealthy(name),
+    systemServicePid(name),
+    portOpen(SERVICES[name].port),
+  ])
+  return healthy || Boolean(pid) || listening
+}
+
+export function actionsForPhase(phase: ServicePhase, locked = false): ServiceActions {
+  if (locked || phase === 'STOPPING') return { start: false, stop: false, restart: false }
+  if (phase === 'READY' || phase === 'DEGRADED') return { start: false, stop: true, restart: true }
+  if (phase === 'STARTING') return { start: false, stop: true, restart: false }
+  return { start: true, stop: false, restart: false }
 }
 
 async function processUsage(pid?: number): Promise<{ cpu?: number; memory?: number; uptime?: number }> {
@@ -115,17 +148,30 @@ async function health(url?: string): Promise<{ ok: boolean; status?: number; lat
 export async function listServices() {
   const supervisor = await supervisorStatus()
   return Promise.all((Object.entries(SERVICES) as [ServiceName, typeof SERVICES[ServiceName]][]).map(async ([name, config]) => {
-    const listening = await portOpen(config.port)
+    const systemName = !config.supervisor ? name as 'mysql' | 'redis' : undefined
+    const [listening, nativeHealthy] = await Promise.all([
+      portOpen(config.port),
+      systemName ? systemServiceHealthy(systemName) : Promise.resolve(false),
+    ])
     const processState = config.supervisor ? supervisor.get(name) : undefined
-    const appHealth = listening ? await health(config.health) : { ok: false }
-    const pid = processState?.pid || (!config.supervisor ? await systemServicePid(name as 'mysql' | 'redis') : undefined)
+    const appHealth = systemName
+      ? { ok: nativeHealthy }
+      : listening ? await health(config.health) : { ok: false }
+    const pid = processState?.pid || (systemName ? await systemServicePid(systemName) : undefined)
     const usage = await processUsage(pid)
-    const rawState = config.supervisor ? (processState?.state || 'NOT_MANAGED') : (listening ? 'RUNNING' : 'STOPPED')
-    const phase: ServicePhase = appHealth.ok && listening
-      ? 'READY'
+    const activeAction = activeActions.get(name)
+    const rawState = activeAction === 'stop'
+      ? 'STOPPING'
+      : activeAction === 'start' || activeAction === 'restart'
+        ? 'STARTING'
+        : config.supervisor ? (processState?.state || 'NOT_MANAGED') : (nativeHealthy || listening || pid ? 'RUNNING' : 'STOPPED')
+    const phase: ServicePhase = rawState === 'STOPPING'
+      ? 'STOPPING'
       : rawState === 'STARTING'
         ? 'STARTING'
-        : listening
+        : appHealth.ok && listening
+          ? 'READY'
+          : listening || Boolean(pid)
           ? 'DEGRADED'
           : rawState === 'FATAL' || rawState === 'BACKOFF' || rawState === 'EXITED'
             ? 'FAILED'
@@ -145,6 +191,8 @@ export async function listServices() {
       ...usage,
       listening,
       healthy: listening && appHealth.ok,
+      activeAction,
+      allowedActions: actionsForPhase(phase, Boolean(activeAction) || currentOperation?.state === 'running'),
       healthStatus: appHealth.status,
       healthLatencyMs: appHealth.latencyMs,
       stability,
@@ -154,22 +202,57 @@ export async function listServices() {
   }))
 }
 
-export async function actOnService(name: ServiceName, action: ServiceAction) {
+async function performServiceAction(name: ServiceName, action: ServiceAction) {
   const config = SERVICES[name]
   if (config.supervisor) {
     const state = (await supervisorStatus()).get(name)?.state
     if (action === 'start' && (state === 'RUNNING' || state === 'STARTING')) return { message: `${config.label} 已经在运行` }
     if (action === 'stop' && (!state || ['STOPPED', 'EXITED', 'FATAL', 'BACKOFF'].includes(state))) return { message: `${config.label} 已经停止` }
+    if (action === 'restart' && (!state || ['STOPPED', 'EXITED', 'FATAL', 'BACKOFF'].includes(state))) {
+      throw new ServiceOperationConflict(`${config.label} 当前未运行，请使用启动`)
+    }
+    if (action === 'restart' && state === 'STARTING') throw new ServiceOperationConflict(`${config.label} 正在启动，请等待就绪或先停止`)
   } else {
-    const listening = await portOpen(config.port)
-    if (action === 'start' && listening) return { message: `${config.label} 已经在运行` }
-    if (action === 'stop' && !listening) return { message: `${config.label} 已经停止` }
+    const running = await systemServiceRunning(name as 'mysql' | 'redis')
+    if (action === 'start' && running) return { message: `${config.label} 已经在运行` }
+    if (action === 'stop' && !running) return { message: `${config.label} 已经停止` }
+    if (action === 'restart' && !running) throw new ServiceOperationConflict(`${config.label} 当前未运行，请使用启动`)
   }
-  const result = config.supervisor
-    ? await run('/root/miniconda3/bin/supervisorctl', ['-c', SUPERVISOR_CONFIG, action, name], 30_000)
-    : await run('/usr/sbin/service', [name === 'redis' ? 'redis-server' : name, action], 30_000)
+
+  let result
+  if (config.supervisor) {
+    result = await run('/root/miniconda3/bin/supervisorctl', ['-c', SUPERVISOR_CONFIG, action, name], 30_000)
+  } else if (name === 'redis' && (action === 'stop' || action === 'restart')) {
+    result = await run('/usr/bin/redis-cli', ['SHUTDOWN', 'SAVE'], 20_000)
+    if (result.code !== 0 && await systemServiceRunning('redis')) {
+      throw new Error((result.stderr || result.stdout || 'Redis 安全停止失败').trim())
+    }
+    if (action === 'restart') {
+      await waitFor('redis', false)
+      result = await run('/usr/sbin/service', ['redis-server', 'start'], 30_000)
+    }
+  } else {
+    result = await run('/usr/sbin/service', [name === 'redis' ? 'redis-server' : name, action], 30_000)
+  }
   if (result.code !== 0) throw new Error((result.stderr || result.stdout || '操作失败').trim())
   return { message: (result.stdout || `${config.label} ${action} 完成`).trim() }
+}
+
+async function executeServiceAction(name: ServiceName, action: ServiceAction, options: { batch?: boolean; wait?: boolean } = {}) {
+  if (!options.batch && currentOperation?.state === 'running') throw new ServiceOperationConflict('批量操作正在执行，请等待完成')
+  if (activeActions.has(name)) throw new ServiceOperationConflict(`${SERVICES[name].label} 正在执行其他操作`)
+  activeActions.set(name, action)
+  try {
+    const result = await performServiceAction(name, action)
+    if (options.wait) await waitFor(name, action !== 'stop')
+    return result
+  } finally {
+    activeActions.delete(name)
+  }
+}
+
+export async function actOnService(name: ServiceName, action: ServiceAction) {
+  return executeServiceAction(name, action)
 }
 
 function logPath(name: ServiceName, source: LogSource): string {
@@ -221,12 +304,30 @@ export async function serviceLogs(name: ServiceName, options: { lines: number; l
   }
 }
 
+async function serviceReady(name: ServiceName): Promise<boolean> {
+  if (name === 'mysql' || name === 'redis') return systemServiceHealthy(name)
+  if (!await portOpen(SERVICES[name].port)) return false
+  return (await health(SERVICES[name].health)).ok
+}
+
+async function serviceStopped(name: ServiceName): Promise<boolean> {
+  if (name === 'mysql' || name === 'redis') return !(await systemServiceRunning(name))
+  const state = (await supervisorStatus()).get(name)?.state
+  const stoppedState = !state || ['STOPPED', 'EXITED', 'FATAL', 'BACKOFF'].includes(state)
+  return stoppedState && !await portOpen(SERVICES[name].port)
+}
+
 async function waitFor(name: ServiceName, running: boolean): Promise<void> {
   const timeout = name === 'index-tts' ? 10 * 60_000 : name === 'manager-api' || name === 'xiaozhi-server' ? 3 * 60_000 : 60_000
   const started = Date.now()
   while (Date.now() - started < timeout) {
-    const listening = await portOpen(SERVICES[name].port)
-    if (running ? listening : !listening) return
+    if (running && SERVICES[name].supervisor) {
+      const processState = (await supervisorStatus()).get(name)
+      if (processState && ['FATAL', 'BACKOFF', 'EXITED'].includes(processState.state)) {
+        throw new Error(`${SERVICES[name].label} 启动失败：${processState.detail || processState.state}`)
+      }
+    }
+    if (running ? await serviceReady(name) : await serviceStopped(name)) return
     await new Promise((resolve) => setTimeout(resolve, 1_500))
   }
   throw new Error(`${SERVICES[name].label} 等待${running ? '启动' : '停止'}超时`)
@@ -236,7 +337,7 @@ export interface BatchStep {
   service: ServiceName
   label: string
   action: 'start' | 'stop'
-  state: 'pending' | 'running' | 'done' | 'failed'
+  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
   message?: string
 }
 
@@ -250,6 +351,16 @@ export interface BatchOperation {
 }
 
 let currentOperation: BatchOperation | undefined
+
+const startDependencies: Partial<Record<ServiceName, ServiceName[]>> = {
+  'manager-api': ['mysql', 'redis'],
+  'xiaozhi-server': ['manager-api', 'index-tts'],
+}
+
+export function failedDependencies(service: ServiceName, failed: Iterable<ServiceName>): ServiceName[] {
+  const failedSet = failed instanceof Set ? failed : new Set(failed)
+  return (startDependencies[service] || []).filter((dependency) => failedSet.has(dependency))
+}
 
 function operationSteps(action: ServiceAction): BatchStep[] {
   const actions: Array<{ service: ServiceName; action: 'start' | 'stop' }> = action === 'restart'
@@ -265,19 +376,30 @@ function operationSteps(action: ServiceAction): BatchStep[] {
 
 async function executeBatch(operation: BatchOperation): Promise<void> {
   let failed = false
+  const failedStarts = new Set<ServiceName>()
   try {
     for (const step of operation.steps) {
+      if (step.action === 'start') {
+        const unavailable = failedDependencies(step.service, failedStarts)
+        if (unavailable.length) {
+          step.state = 'skipped'
+          step.message = `依赖 ${unavailable.map((name) => SERVICES[name].label).join('、')} 启动失败，已跳过`
+          failedStarts.add(step.service)
+          failed = true
+          continue
+        }
+      }
       step.state = 'running'
       try {
-        const result = await actOnService(step.service, step.action)
-        await waitFor(step.service, step.action === 'start')
+        const result = await executeServiceAction(step.service, step.action, { batch: true, wait: true })
         step.state = 'done'
         step.message = result.message
       } catch (error) {
         step.state = 'failed'
         step.message = error instanceof Error ? error.message : '操作失败'
         failed = true
-        // 单项失败不阻断后续服务，避免重启全部时把网关或数据库留在停止状态。
+        if (step.action === 'start') failedStarts.add(step.service)
+        // 停止操作始终继续；启动操作仅跳过依赖失败的下游，独立服务仍继续处理。
       }
     }
     operation.state = failed ? 'failed' : 'done'
@@ -289,7 +411,8 @@ async function executeBatch(operation: BatchOperation): Promise<void> {
 }
 
 export function startBatchOperation(action: ServiceAction): BatchOperation {
-  if (currentOperation?.state === 'running') throw new Error('已有批量操作正在执行')
+  if (currentOperation?.state === 'running') throw new ServiceOperationConflict('已有批量操作正在执行')
+  if (activeActions.size) throw new ServiceOperationConflict('有服务正在执行单项操作，请等待完成')
   const operation: BatchOperation = {
     id: crypto.randomUUID(),
     action,

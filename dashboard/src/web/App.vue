@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 
-type ServicePhase = 'READY' | 'STARTING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
+type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
 type Service = {
   name: string
   label: string
@@ -20,12 +20,14 @@ type Service = {
   stability?: { restartCount10m: number; lastStartedAt?: string }
   signals?: Array<{ label: string; value: string; tone: 'normal' | 'info' | 'warning' | 'critical' | 'muted'; logLevel?: string; logKeyword?: string; logSource?: 'service' | 'access' | 'error'; logPreset?: 'http-errors' | 'manager-requests' }>
   lastError?: string
+  activeAction?: 'start' | 'stop' | 'restart'
+  allowedActions?: { start: boolean; stop: boolean; restart: boolean }
 }
 type BatchStep = {
   service: string
   label: string
   action: 'start' | 'stop'
-  state: 'pending' | 'running' | 'done' | 'failed'
+  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
   message?: string
 }
 type BatchOperation = {
@@ -150,6 +152,7 @@ let checkProgressTimer: number | undefined
 let loadedUpdateId = ''
 
 const serviceOrder = ['xiaozhi-server', 'web-gateway', 'manager-api', 'index-tts', 'mysql', 'redis']
+const repositoryKeys = ['xiaozhi', 'index-tts', 'xiaozhi-autodl']
 const services = computed<Service[]>(() => [...(overview.value?.services || [])].sort((left, right) => {
   const leftIndex = serviceOrder.indexOf(left.name)
   const rightIndex = serviceOrder.indexOf(right.name)
@@ -157,17 +160,19 @@ const services = computed<Service[]>(() => [...(overview.value?.services || [])]
 }))
 const operation = computed<BatchOperation | undefined>(() => overview.value?.operation)
 const serviceHealth = computed(() => {
-  const counts = { ready: 0, starting: 0, degraded: 0, stopped: 0, failed: 0 }
+  const counts = { ready: 0, starting: 0, stopping: 0, degraded: 0, stopped: 0, failed: 0 }
   for (const service of services.value) counts[service.phase.toLowerCase() as keyof typeof counts]++
   const tone = counts.failed ? 'failed'
     : counts.degraded ? 'degraded'
       : counts.starting ? 'starting'
+        : counts.stopping ? 'stopping'
         : counts.stopped ? 'stopped'
           : counts.ready ? 'ready' : 'unknown'
   const details = [
     counts.failed ? `${counts.failed}项失败` : '',
     counts.degraded ? `${counts.degraded}项异常` : '',
     counts.starting ? `${counts.starting}项启动中` : '',
+    counts.stopping ? `${counts.stopping}项停止中` : '',
     counts.stopped ? `${counts.stopped}项停止` : '',
   ].filter(Boolean)
   return {
@@ -198,6 +203,15 @@ const versionHealth = computed(() => {
   if (updates.length) return { tone: 'available', text: `代码版本 ${updates.length} 项可更新`, detail: '更新 →' }
   return { tone: 'current', text: `代码版本 ${repositories.length}/${repositories.length} 已同步`, detail: '查看 →' }
 })
+const selfVersionHealth = computed(() => {
+  const repository = versionState.value?.repositories.find((item) => item.key === 'xiaozhi-autodl')
+  const version = overview.value?.release?.version ? `v${overview.value.release.version}` : '版本'
+  if (updateOperation.value?.repository === 'xiaozhi-autodl' && updateOperation.value.state === 'running') return { tone: 'checking', text: version, detail: '升级中' }
+  if (checkingRepositories.value.includes('xiaozhi-autodl')) return { tone: 'checking', text: version, detail: '检查中' }
+  if (repository?.remoteCheckOk === false) return { tone: 'failed', text: version, detail: '检查失败' }
+  if (repository?.updateAvailable) return { tone: 'available', text: version, detail: '可更新' }
+  return { tone: repository?.remoteCheckedAt ? 'current' : 'unchecked', text: version, detail: '' }
+})
 const systemDisk = computed(() => overview.value?.metrics?.disks?.find((item: any) => item.mount === '/'))
 const dataDisk = computed(() => overview.value?.metrics?.disks?.find((item: any) => item.mount === '/root/autodl-tmp'))
 const gpu = computed(() => overview.value?.metrics?.gpu?.[0])
@@ -207,6 +221,24 @@ const endpointReadiness = computed(() => {
   if (!readiness) return { ready: endpoints.value?.gatewayReachable ? 1 : 0, total: 1, allReady: Boolean(endpoints.value?.gatewayReachable) }
   const ready = Object.values(readiness).filter(Boolean).length
   return { ready, total: 3, allReady: ready === 3 }
+})
+const endpointStatus = computed(() => {
+  const current = endpoints.value
+  const readiness = `智控台 ${current?.readiness?.managerWeb ? '就绪' : '未就绪'} · OTA ${current?.readiness?.ota ? '就绪' : '未就绪'} · WebSocket ${current?.readiness?.websocket ? '就绪' : '未就绪'}`
+  const rawMessage = current?.sync?.message || ''
+  if (current?.inSync) {
+    return {
+      text: `地址已同步 · 接口 ${endpointReadiness.value.ready}/${endpointReadiness.value.total} 就绪`,
+      title: `${readiness}${rawMessage ? `\n${rawMessage}` : ''}`,
+    }
+  }
+  if (current?.sync?.state === 'failed') {
+    const reason = /(?:can't connect to mysql|mysql server|mysqld|3306)/i.test(rawMessage)
+      ? 'MySQL 未就绪'
+      : rawMessage || '未知错误'
+    return { text: `地址同步失败 · ${reason}`, title: `${readiness}\n${rawMessage || reason}` }
+  }
+  return { text: rawMessage || '等待同步', title: `${readiness}${rawMessage ? `\n${rawMessage}` : ''}` }
 })
 const logSourceOptions = computed(() => logs.service === 'web-gateway'
   ? [{ value: 'access', label: '访问日志' }, { value: 'error', label: '错误日志' }, { value: 'service', label: '启动日志' }]
@@ -220,7 +252,16 @@ const logDownloadUrl = computed(() => {
 const operationProgress = computed(() => {
   const steps = operation.value?.steps || []
   if (!steps.length) return 0
-  return Math.round(steps.filter((step) => step.state === 'done' || step.state === 'failed').length / steps.length * 100)
+  return Math.round(steps.filter((step) => ['done', 'failed', 'skipped'].includes(step.state)).length / steps.length * 100)
+})
+const operationSummary = computed(() => {
+  const steps = operation.value?.steps || []
+  const running = steps.find((step) => step.state === 'running')
+  if (running) return `${running.action === 'start' ? '启动' : '停止'} ${running.label}`
+  const failed = steps.filter((step) => step.state === 'failed')
+  const skipped = steps.filter((step) => step.state === 'skipped')
+  if (failed.length || skipped.length) return `${failed.length} 项失败${skipped.length ? ` · ${skipped.length} 项因依赖跳过` : ''}：${failed[0]?.message || skipped[0]?.message}`
+  return `已完成 ${operationProgress.value}%`
 })
 
 type MetricTone = 'normal' | 'warning' | 'critical' | 'muted'
@@ -263,6 +304,7 @@ function fmtComponents(components?: string[]) {
 const phaseLabels: Record<ServicePhase, string> = {
   READY: '运行正常',
   STARTING: '正在启动',
+  STOPPING: '正在停止',
   DEGRADED: '等待就绪',
   STOPPED: '已停止',
   FAILED: '启动失败',
@@ -303,6 +345,12 @@ function navigate(page: 'overview' | 'versions') {
   if (window.location.pathname !== path) window.history.pushState({}, '', path)
   currentPage.value = page
   window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+async function navigateToRepository(repository: string) {
+  navigate('versions')
+  await nextTick()
+  document.getElementById(`repository-${repository}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 function handlePopState() {
@@ -436,7 +484,9 @@ function requestSafeUpdate(repository: RepositoryState) {
     ? '仓库存在受保护的本地改动，当前不能自动更新。'
     : repository.dependencyBlocked
       ? `这次更新包含依赖清单变化：${repository.dependencyChanges?.join('、')}，需要先升级环境。`
-      : `将快进到 ${repository.upstream}，只构建并刷新 ${fmtComponents(repository.affectedComponents)}；失败会自动回滚。确认继续吗？`
+      : repository.key === 'xiaozhi-autodl'
+        ? `将快进到 ${repository.upstream}，构建新运维中心并自动重启 Dashboard；升级结果会保存在数据盘，失败时自动回滚。确认继续吗？`
+        : `将快进到 ${repository.upstream}，只构建并刷新 ${fmtComponents(repository.affectedComponents)}；失败会自动回滚。确认继续吗？`
   confirmBox.action = 'safe-update'
   confirmBox.service = repository.key
   pendingUpdateRef.value = updateTargets[repository.key] || repository.upstream || ''
@@ -678,7 +728,7 @@ function stopRepositoryProgressPollingIfIdle() {
 }
 
 async function checkVersions(repository?: string, silent = false) {
-  const targets = repository ? [repository] : ['xiaozhi', 'index-tts']
+  const targets = repository ? [repository] : repositoryKeys
   if (targets.some(isRepositoryChecking)) return
   checkingRepositories.value = [...new Set([...checkingRepositories.value, ...targets])]
   startRepositoryProgressPolling()
@@ -694,7 +744,7 @@ async function checkVersions(repository?: string, silent = false) {
     if (!silent) toast(
       repository
         ? `${checked?.label || repository}：${checked?.remoteCheckMessage || (checked ? remoteVersionLabel(checked) : '检查完成')}`
-        : failures.length ? `${failures.length} 个仓库检查失败：${failures.map((item) => item.label).join('、')}` : updates ? `检测到 ${updates} 个部署分支有新提交` : '两个部署分支均已同步',
+        : failures.length ? `${failures.length} 个仓库检查失败：${failures.map((item) => item.label).join('、')}` : updates ? `检测到 ${updates} 个部署分支有新提交` : '三个部署分支均已同步',
       failures.length ? 'error' : 'ok',
     )
   } catch (error) { if (!silent) toast((error as Error).message, 'error') }
@@ -788,7 +838,7 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="topbar-brand">
         <img :src="'/brand/logo.png'" alt="智控台" />
-        <div><strong>AutoDL 运维中心 <em v-if="overview?.release?.version">v{{ overview.release.version }}</em></strong><small>服务监控与运行控制</small></div>
+        <div><strong>AutoDL 运维中心 <button :class="['self-version', selfVersionHealth.tone]" :title="`xiaozhi-autodl ${selfVersionHealth.detail || '版本详情'}`" @click="navigateToRepository('xiaozhi-autodl')"><i></i>{{ selfVersionHealth.text }}<span v-if="selfVersionHealth.detail">{{ selfVersionHealth.detail }}</span></button></strong><small>服务监控与运行控制</small></div>
       </div>
       <nav class="quick-links" aria-label="页面与智控台快捷入口">
         <a href="/" :class="{ active: currentPage === 'overview' }" @click.prevent="navigate('overview')">运行总览</a>
@@ -847,8 +897,8 @@ onBeforeUnmount(() => {
         <div class="access-heading">
           <span class="access-icon">⌁</span>
           <div><h2>客户端接入</h2><p :title="endpoints.sourceDetail || `${endpointModeLabels[endpoints.config.mode]} · ${endpoints.source}`">{{ endpointModeLabels[endpoints.config.mode] }} · {{ endpoints.source }}</p></div>
-          <span :class="['access-state', endpoints.inSync && endpointReadiness.allReady ? 'ready' : endpoints.sync?.state === 'failed' ? 'failed' : 'pending']" :title="`智控台 ${endpoints.readiness?.managerWeb ? '就绪' : '未就绪'} · OTA ${endpoints.readiness?.ota ? '就绪' : '未就绪'} · WebSocket ${endpoints.readiness?.websocket ? '就绪' : '未就绪'}`">
-            <i></i>{{ endpoints.inSync ? `地址已同步 · 接口 ${endpointReadiness.ready}/${endpointReadiness.total} 就绪` : endpoints.sync?.message || '等待同步' }}
+          <span :class="['access-state', endpoints.inSync && endpointReadiness.allReady ? 'ready' : endpoints.sync?.state === 'failed' ? 'failed' : 'pending']" :title="endpointStatus.title">
+            <i></i><span>{{ endpointStatus.text }}</span>
           </span>
         </div>
         <div class="endpoint-list">
@@ -871,7 +921,7 @@ onBeforeUnmount(() => {
       <section v-if="operation" :class="['operation-bar', operation.state]">
         <div class="operation-copy">
           <span>{{ operation.state === 'running' ? '批量操作执行中' : operation.state === 'done' ? '批量操作完成' : '批量操作遇到错误' }}</span>
-          <small>{{ operation.steps.find((step) => step.state === 'running')?.label || operation.steps.find((step) => step.state === 'failed')?.message || `已完成 ${operationProgress}%` }}</small>
+          <small :title="operation.steps.filter((step) => step.message).map((step) => `${step.label}：${step.message}`).join('\n')">{{ operationSummary }}</small>
         </div>
         <div class="operation-track"><i :style="{ width: `${operationProgress}%` }"></i></div>
         <b>{{ operationProgress }}%</b>
@@ -900,9 +950,9 @@ onBeforeUnmount(() => {
           </div>
           <div class="service-actions">
             <button @click="showLogs(service)">查看日志</button>
-            <button :disabled="busy || service.phase === 'READY' || service.phase === 'STARTING'" @click="requestServiceAction(service, 'start')">启动</button>
-            <button :disabled="busy || service.phase === 'STOPPED'" @click="requestServiceAction(service, 'restart')">重启</button>
-            <button class="danger" :disabled="busy || service.phase === 'STOPPED'" @click="requestServiceAction(service, 'stop')">停止</button>
+            <button :disabled="busy || !service.allowedActions?.start" @click="requestServiceAction(service, 'start')">{{ service.phase === 'FAILED' ? '重试启动' : '启动' }}</button>
+            <button :disabled="busy || !service.allowedActions?.restart" @click="requestServiceAction(service, 'restart')">重启</button>
+            <button class="danger" :disabled="busy || !service.allowedActions?.stop" @click="requestServiceAction(service, 'stop')">停止</button>
           </div>
         </article>
       </section>
@@ -915,15 +965,15 @@ onBeforeUnmount(() => {
       </div>
 
       <section class="version-guide">
-        <div><b>部署分支状态</b><span>小智仅比较 mvp，IndexTTS 仅比较 main，不参考其他远端分支。</span></div>
+        <div><b>部署分支状态</b><span>小智仅比较 mvp，IndexTTS 与 xiaozhi-autodl 仅比较 main。</span></div>
         <div><b>工作区状态</b><span>本地修改不会阻止检查，但会锁定自动更新，避免覆盖已调通代码。</span></div>
         <div><b>安全更新</b><span>仅允许快进；依赖变化、构建失败或健康检查失败会暂停或自动回滚。</span></div>
       </section>
 
       <section v-if="versionState" class="repository-grid">
-        <article v-for="repository in versionState.repositories" :key="repository.key" class="repository-card">
+        <article v-for="repository in versionState.repositories" :id="`repository-${repository.key}`" :key="repository.key" :class="['repository-card', { 'self-repository': repository.key === 'xiaozhi-autodl' }]">
           <header>
-            <div><span class="repository-icon">{{ repository.key === 'xiaozhi' ? 'X' : 'I' }}</span><div><h2>{{ repository.label }}</h2><a v-if="repository.remoteUrl" :href="repository.remoteUrl" target="_blank">{{ repository.remoteUrl }} ↗</a></div></div>
+            <div><span class="repository-icon">{{ repository.key === 'xiaozhi' ? 'X' : repository.key === 'index-tts' ? 'I' : 'A' }}</span><div><h2>{{ repository.label }}</h2><a v-if="repository.remoteUrl" :href="repository.remoteUrl" target="_blank">{{ repository.remoteUrl }} ↗</a></div></div>
             <span :class="['remote-status', remoteVersionTone(repository)]"><i></i>{{ remoteVersionLabel(repository) }}</span>
           </header>
 
@@ -965,7 +1015,7 @@ onBeforeUnmount(() => {
             <label>固定部署目标<span class="fixed-target">{{ repository.upstream || `origin/${repository.deployBranch}` }}</span></label>
             <div>
               <button :disabled="isRepositoryChecking(repository.key)" @click="checkVersions(repository.key)">{{ isRepositoryChecking(repository.key) ? repositoryCheckLabel(repository.key) : '检查该仓库' }}</button>
-              <button class="primary" :disabled="busy || !repository.updateAvailable || repository.updateBlocked || repository.dependencyBlocked || repository.canFastForward === false || updateOperation?.state === 'running'" :title="repository.blockingChanges?.join('\n')" @click="requestSafeUpdate(repository)">{{ repository.dependencyBlocked ? '需要升级环境' : repository.updateAvailable ? '安全更新并刷新服务' : '已是最新版本' }}</button>
+              <button class="primary" :disabled="busy || !repository.updateAvailable || repository.updateBlocked || repository.dependencyBlocked || repository.canFastForward === false || updateOperation?.state === 'running'" :title="repository.blockingChanges?.join('\n')" @click="requestSafeUpdate(repository)">{{ repository.dependencyBlocked ? '需要升级环境' : repository.updateAvailable ? repository.key === 'xiaozhi-autodl' ? '安全更新并重启 Dashboard' : '安全更新并刷新服务' : '已是最新版本' }}</button>
             </div>
           </footer>
         </article>

@@ -13,9 +13,14 @@ export NUMEXPR_NUM_THREADS="$OMP_NUM_THREADS"
 export OMP_DYNAMIC=FALSE
 export TOKENIZERS_PARALLELISM=false
 
+manager_ready=false
 for _ in $(seq 1 120); do
-  if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:8002/xiaozhi/user/pub-config >/dev/null; then break; fi
+  if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:8002/xiaozhi/user/pub-config >/dev/null; then
+    manager_ready=true
+    break
+  fi
   sleep 1
 done
+[[ "$manager_ready" == true ]] || { echo 'Manager API 在 120 秒内未就绪，小智服务端取消启动' >&2; exit 1; }
 cd /root/xiaozhi-esp32-server/main/xiaozhi-server
 exec "$python_bin" app.py

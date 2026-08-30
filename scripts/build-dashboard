@@ -2,10 +2,22 @@
 set -euo pipefail
 
 project=/root/xiaozhi-autodl/dashboard
+runtime=/root/autodl-tmp/xiaozhi-autodl
 cd "$project"
 
-if [[ ! -d node_modules ]]; then
-  npm install
+mkdir -p "$runtime/run"
+lock_hash_file="$runtime/run/dashboard-package-lock.sha256"
+current_lock_hash=$(sha256sum package-lock.json | awk '{print $1}')
+installed_lock_hash=
+[[ -r "$lock_hash_file" ]] && installed_lock_hash=$(<"$lock_hash_file")
+
+if [[ ! -d node_modules || "$current_lock_hash" != "$installed_lock_hash" ]]; then
+  echo "Dashboard 依赖锁文件发生变化，按 package-lock.json 安装依赖"
+  npm ci --prefer-offline --no-audit
+  temporary_hash_file="${lock_hash_file}.$$"
+  printf '%s\n' "$current_lock_hash" > "$temporary_hash_file"
+  chmod 0644 "$temporary_hash_file"
+  mv "$temporary_hash_file" "$lock_hash_file"
 fi
 
 npm run typecheck

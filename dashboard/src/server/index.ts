@@ -29,6 +29,7 @@ import {
   actOnService,
   getCurrentOperation,
   listServices,
+  ServiceOperationConflict,
   serviceLogs,
   startBatchOperation,
   type LogLevel,
@@ -143,7 +144,10 @@ app.get('/api/overview', async () => ({
 app.post('/api/services/:name/:action', async (request, reply) => {
   const { name, action } = request.params as { name: string; action: string }
   if (!isServiceName(name) || !isServiceAction(action)) return reply.code(400).send({ error: '不支持的服务或动作' })
-  try { return await actOnService(name, action) } catch (error) { return reply.code(500).send({ error: error instanceof Error ? error.message : '操作失败' }) }
+  try { return await actOnService(name, action) }
+  catch (error) {
+    return reply.code(error instanceof ServiceOperationConflict ? 409 : 500).send({ error: error instanceof Error ? error.message : '操作失败' })
+  }
 })
 
 app.post('/api/services/batch/:action', async (request, reply) => {
@@ -181,12 +185,12 @@ app.post('/api/versions/check', async (request, reply) => {
   catch (error) { return reply.code(500).send({ error: error instanceof Error ? error.message : '更新检测失败' }) }
 })
 
-app.get('/api/updates/current', async () => ({ operation: currentSafeUpdate() }))
+app.get('/api/updates/current', async () => ({ operation: await currentSafeUpdate() }))
 
 app.post('/api/updates/:repository', async (request, reply) => {
   const { repository } = request.params as { repository: string }
   const { ref } = (request.body || {}) as { ref?: string }
-  try { return reply.code(202).send(startSafeUpdate(repository, ref)) }
+  try { return reply.code(202).send(await startSafeUpdate(repository, ref)) }
   catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : '安全更新无法启动' }) }
 })
 

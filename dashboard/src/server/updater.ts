@@ -1,5 +1,9 @@
 import net from 'node:net'
-import { SUPERVISOR_CONFIG } from './config.js'
+import { spawn } from 'node:child_process'
+import { closeSync, openSync } from 'node:fs'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
+import { PROJECT_ROOT, RUNTIME_ROOT, SUPERVISOR_CONFIG } from './config.js'
 import { run } from './process.js'
 import { affectedComponentsForFiles, fetchDeploymentBranch, git, isRepositoryKey, REPOSITORIES, repositoryState, type RepositoryKey } from './versions.js'
 
@@ -19,10 +23,29 @@ export interface UpdateOperation {
   steps: UpdateStep[]
   logs: string[]
   message?: string
+  workerPid?: number
 }
 
 const supervisorctl = '/root/miniconda3/bin/supervisorctl'
+const updateStatePath = resolve(RUNTIME_ROOT, 'run/update-operation.json')
 let currentUpdate: UpdateOperation | undefined
+
+async function persistUpdate(operation: UpdateOperation) {
+  await mkdir(resolve(RUNTIME_ROOT, 'run'), { recursive: true })
+  const temporary = `${updateStatePath}.${process.pid}.tmp`
+  await writeFile(temporary, `${JSON.stringify(operation, null, 2)}\n`, { mode: 0o600 })
+  await rename(temporary, updateStatePath)
+}
+
+async function persistedUpdate(): Promise<UpdateOperation | undefined> {
+  try { return JSON.parse(await readFile(updateStatePath, 'utf8')) as UpdateOperation }
+  catch { return undefined }
+}
+
+function processRunning(pid?: number): boolean {
+  if (!pid) return false
+  try { process.kill(pid, 0); return true } catch { return false }
+}
 
 function addLog(operation: UpdateOperation, message: string) {
   operation.logs.push(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${message}`)
@@ -70,7 +93,7 @@ async function waitReady(check: { port: number; timeout: number; health?: string
 async function refreshComponents(repository: RepositoryKey, selected?: string[]) {
   const components = selected !== undefined ? selected : repository === 'xiaozhi'
     ? ['manager-web', 'manager-api', 'xiaozhi-server']
-    : ['index-tts']
+    : repository === 'index-tts' ? ['index-tts'] : ['dashboard']
   if (!components.length) return { code: 0, stdout: '本次仅文档变更，无需构建或刷新运行服务', stderr: '' }
   return run('/root/xiaozhi-autodl/scripts/refresh-runtime', components, 30 * 60_000)
 }
@@ -89,7 +112,9 @@ async function dependencyChanges(repository: RepositoryKey, path: string, from: 
         /^main\/manager-web\/(?:package|package-lock)\.json$/,
         /^main\/manager-api\/(?:pom\.xml|\.mvn\/|mvnw)/,
       ]
-    : [/^(?:pyproject\.toml|uv\.lock|requirements.*\.txt)$/]
+    : repository === 'index-tts'
+      ? [/^(?:pyproject\.toml|uv\.lock|requirements.*\.txt)$/]
+      : [/^(?:environment.*\.ya?ml|requirements.*\.txt)$/]
   return result.stdout.trim().split('\n').filter(Boolean).filter((file) => blockers.some((pattern) => pattern.test(file)))
 }
 
@@ -98,11 +123,14 @@ async function executeUpdate(operation: UpdateOperation) {
   let oldCommit = ''
   let changedSource = false
   const runtimeStates: Record<string, string> = {}
-  const programs = operation.repository === 'xiaozhi' ? ['web-gateway', 'manager-api', 'xiaozhi-server'] : ['index-tts']
+  const programs = operation.repository === 'xiaozhi'
+    ? ['web-gateway', 'manager-api', 'xiaozhi-server']
+    : operation.repository === 'index-tts' ? ['index-tts'] : ['dashboard']
   try {
     for (const program of programs) runtimeStates[program] = await supervisorState(program)
     for (const step of operation.steps) {
       step.state = 'running'
+      await persistUpdate(operation)
       if (step.name === 'preflight') {
         const state = await repositoryState(operation.repository)
         if (!state.available || !state.commit || !state.branch || !state.upstream) throw new Error('仓库或上游分支不可用')
@@ -151,6 +179,7 @@ async function executeUpdate(operation: UpdateOperation) {
           'manager-api': { program: 'manager-api', port: 8002, timeout: 180_000, health: 'http://127.0.0.1:8002/xiaozhi/user/pub-config' },
           'xiaozhi-server': { program: 'xiaozhi-server', port: 8000, timeout: 180_000 },
           'index-tts': { program: 'index-tts', port: 8092, timeout: 10 * 60_000, health: 'http://127.0.0.1:8092/health/ready' },
+          dashboard: { program: 'dashboard', port: 6006, timeout: 60_000, health: 'http://127.0.0.1:6006/api/health' },
         }
         const checks = (operation.components || []).map((component) => componentChecks[component]).filter(Boolean)
         for (const check of checks) {
@@ -163,12 +192,14 @@ async function executeUpdate(operation: UpdateOperation) {
         addLog(operation, '原运行服务均已通过端口就绪检查')
       }
       step.state = 'done'
+      await persistUpdate(operation)
     }
     operation.state = 'done'
     operation.message = `已更新到 ${operation.toCommit}`
   } catch (error) {
     const message = error instanceof Error ? error.message : '更新失败'
-    operation.steps.find((step) => step.state === 'running')!.state = 'failed'
+    const runningStep = operation.steps.find((step) => step.state === 'running')
+    if (runningStep) runningStep.state = 'failed'
     addLog(operation, message)
     if (changedSource && oldCommit) {
       addLog(operation, `开始回滚到 ${oldCommit.slice(0, 10)}`)
@@ -189,12 +220,14 @@ async function executeUpdate(operation: UpdateOperation) {
     }
   } finally {
     operation.finishedAt = new Date().toISOString()
+    await persistUpdate(operation)
   }
 }
 
-export function startSafeUpdate(repository: string, targetRef?: string): UpdateOperation {
+export async function startSafeUpdate(repository: string, targetRef?: string): Promise<UpdateOperation> {
   if (!isRepositoryKey(repository)) throw new Error('不支持的代码仓库')
-  if (currentUpdate?.state === 'running') throw new Error('已有安全更新正在执行')
+  const previous = await currentSafeUpdate()
+  if (previous?.state === 'running') throw new Error('已有安全更新正在执行')
   const operation: UpdateOperation = {
     id: crypto.randomUUID(),
     repository,
@@ -210,11 +243,58 @@ export function startSafeUpdate(repository: string, targetRef?: string): UpdateO
     ],
     logs: [],
   }
-  currentUpdate = operation
-  void executeUpdate(operation)
+  await persistUpdate(operation)
+  if (repository === 'xiaozhi-autodl') {
+    await mkdir(resolve(RUNTIME_ROOT, 'logs'), { recursive: true })
+    const workerLog = openSync(resolve(RUNTIME_ROOT, 'logs/self-update.log'), 'a', 0o600)
+    const worker = spawn(process.execPath, [resolve(PROJECT_ROOT, 'dashboard/dist/server/self-update-worker.js'), operation.id], {
+      cwd: PROJECT_ROOT,
+      detached: true,
+      stdio: ['ignore', workerLog, workerLog],
+      env: { ...process.env, XIAOZHI_AUTODL_UPDATE_WORKER: '1' },
+    })
+    closeSync(workerLog)
+    worker.once('error', (error) => {
+      operation.state = 'failed'
+      operation.finishedAt = new Date().toISOString()
+      operation.message = `无法启动自更新助手：${error.message}`
+      operation.steps[0].state = 'failed'
+      operation.steps[0].message = operation.message
+      void persistUpdate(operation)
+    })
+    worker.unref()
+  } else {
+    currentUpdate = operation
+    void executeUpdate(operation)
+  }
   return operation
 }
 
-export function currentSafeUpdate() {
-  return currentUpdate
+export async function runPersistedSelfUpdate(operationId: string): Promise<void> {
+  const operation = await persistedUpdate()
+  if (!operation || operation.id !== operationId || operation.repository !== 'xiaozhi-autodl') throw new Error('自更新任务不存在或已失效')
+  if (operation.state !== 'running') return
+  operation.workerPid = process.pid
+  await persistUpdate(operation)
+  currentUpdate = operation
+  await executeUpdate(operation)
+}
+
+export async function currentSafeUpdate(): Promise<UpdateOperation | undefined> {
+  const persisted = await persistedUpdate()
+  if (persisted?.state === 'running' && persisted.repository === 'xiaozhi-autodl' && (!persisted.workerPid || !processRunning(persisted.workerPid))) {
+    const age = Date.now() - new Date(persisted.startedAt).getTime()
+    if (age > 10_000) {
+      persisted.state = 'failed'
+      persisted.finishedAt = new Date().toISOString()
+      persisted.message = '自更新助手意外退出，请查看 Dashboard 日志后重试'
+      const step = persisted.steps.find((item) => item.state === 'running' || item.state === 'pending')
+      if (step) {
+        step.state = 'failed'
+        step.message = persisted.message
+      }
+      await persistUpdate(persisted)
+    }
+  }
+  return persisted || currentUpdate
 }

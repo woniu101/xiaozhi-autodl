@@ -5,3 +5,9 @@ if /root/miniconda3/bin/supervisorctl -c "$config" pid >/dev/null 2>&1; then
   /root/miniconda3/bin/supervisorctl -c "$config" stop all || true
   /root/miniconda3/bin/supervisorctl -c "$config" shutdown || true
 fi
+if [[ "$(/usr/bin/redis-cli --raw PING 2>/dev/null || true)" == PONG ]]; then
+  /usr/bin/redis-cli SHUTDOWN SAVE || true
+fi
+if /usr/bin/mysqladmin --defaults-file=/etc/mysql/debian.cnf ping >/dev/null 2>&1 || /usr/bin/pgrep -x mysqld >/dev/null 2>&1; then
+  timeout 30 /usr/sbin/service mysql stop || true
+fi
