@@ -1,7 +1,8 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { RUNTIME_ROOT } from './config.js'
-import { run, type CommandResult } from './process.js'
+import { run } from './process.js'
+import { remoteGit, type GitTransport } from './git-network.js'
 
 export type RepositoryKey = 'xiaozhi' | 'index-tts' | 'xiaozhi-autodl'
 
@@ -14,13 +15,13 @@ export const REPOSITORIES: Record<RepositoryKey, { label: string; path: string; 
 const checkRecordPath = resolve(RUNTIME_ROOT, 'run/version-check.json')
 const automaticCheckIntervalMs = 30 * 60 * 1000
 let automaticTimer: NodeJS.Timeout | undefined
-type FetchResult = { key: RepositoryKey; ok: boolean; message: string; checkedAt: string }
+type FetchResult = { key: RepositoryKey; ok: boolean; message: string; checkedAt: string; transport?: GitTransport; elapsedMs: number }
 const activeChecks = new Map<RepositoryKey, Promise<FetchResult>>()
-type CheckProgress = { key: RepositoryKey; stage: 'connecting' | 'retrying' | 'fetching'; attempt: number; totalAttempts: number; startedAt: number }
+type CheckProgress = { key: RepositoryKey; stage: 'connecting' | 'fallback' | 'fetching'; attempt: number; totalAttempts: number; startedAt: number; transport?: GitTransport }
 const activeProgress = new Map<RepositoryKey, CheckProgress>()
 let checkRecordQueue: Promise<void> = Promise.resolve()
 
-type CheckRecord = Record<string, { checkedAt: string; ok: boolean; message?: string }>
+type CheckRecord = Record<string, { checkedAt: string; ok: boolean; message?: string; transport?: GitTransport; elapsedMs?: number }>
 
 async function readCheckRecord(): Promise<CheckRecord> {
   try { return JSON.parse(await readFile(checkRecordPath, 'utf8')) as CheckRecord }
@@ -42,28 +43,7 @@ export async function git(path: string, args: string[], timeout = 10_000) {
   return run('/usr/bin/git', ['-C', path, ...args], timeout, { GIT_TERMINAL_PROMPT: '0' })
 }
 
-type RemoteResult = CommandResult & { attempts: number; elapsedMs: number }
-
-async function remoteGit(path: string, args: string[], options: {
-  timeout?: number
-  retryTimeout?: number
-  onAttempt?: (attempt: number, totalAttempts: number) => void
-} = {}): Promise<RemoteResult> {
-  const startedAt = Date.now()
-  const timeouts = options.retryTimeout ? [options.timeout || 15_000, options.retryTimeout] : [options.timeout || 15_000]
-  let result: CommandResult | undefined
-  let attempts = 0
-  for (let index = 0; index < timeouts.length; index++) {
-    attempts = index + 1
-    options.onAttempt?.(index + 1, timeouts.length)
-    result = await git(path, ['-c', 'http.version=HTTP/1.1', ...args], timeouts[index])
-    if (result.code === 0) break
-    if (index + 1 < timeouts.length) await new Promise((resolve) => setTimeout(resolve, 1_000))
-  }
-  return { ...(result as CommandResult), attempts, elapsedMs: Date.now() - startedAt }
-}
-
-export async function fetchDeploymentBranch(key: RepositoryKey, onAttempt?: (attempt: number, totalAttempts: number) => void) {
+export async function fetchDeploymentBranch(key: RepositoryKey, onAttempt?: (attempt: number, totalAttempts: number, transport: GitTransport) => void) {
   const repository = REPOSITORIES[key]
   const branchRefspec = `+refs/heads/${repository.deployBranch}:refs/remotes/origin/${repository.deployBranch}`
   return remoteGit(repository.path, ['fetch', '--prune', 'origin', branchRefspec], { timeout: 60_000, onAttempt })
@@ -191,6 +171,8 @@ export async function versionState() {
         remoteCheckedAt: checked?.checkedAt,
         remoteCheckOk: checked?.ok,
         remoteCheckMessage: checked?.message,
+        remoteTransport: checked?.transport,
+        remoteElapsedMs: checked?.elapsedMs,
       }
     }),
   }
@@ -199,14 +181,14 @@ export async function versionState() {
 async function recordFetchResult(result: FetchResult) {
   const task = checkRecordQueue.then(async () => {
     const record = await readCheckRecord()
-    record[result.key] = { checkedAt: result.checkedAt, ok: result.ok, message: result.message || undefined }
+    record[result.key] = { checkedAt: result.checkedAt, ok: result.ok, message: result.message || undefined, transport: result.transport, elapsedMs: result.elapsedMs }
     await writeCheckRecord(record)
   })
   checkRecordQueue = task.catch(() => undefined)
   await task
 }
 
-function remoteFailureMessage(result: RemoteResult): string {
+function remoteFailureMessage(result: Awaited<ReturnType<typeof remoteGit>>): string {
   const raw = (result.stderr || result.errorMessage || result.stdout || '').trim().replace(/(https?:\/\/)[^/@\s]+@/gi, '$1[credentials]@')
   const suffix = `（尝试 ${result.attempts} 次，耗时 ${(result.elapsedMs / 1000).toFixed(1)} 秒）`
   if (result.timedOut) return `连接 GitHub 超时${suffix}`
@@ -234,21 +216,20 @@ async function checkRepositoryOnce(key: RepositoryKey): Promise<FetchResult> {
     const remoteRef = `refs/heads/${repository.deployBranch}`
     const startedAt = Date.now()
     const remote = await remoteGit(repository.path, ['ls-remote', '--heads', 'origin', remoteRef], {
-      timeout: 15_000,
-      retryTimeout: 20_000,
-      onAttempt: (attempt, totalAttempts) => activeProgress.set(key, { key, stage: attempt > 1 ? 'retrying' : 'connecting', attempt, totalAttempts, startedAt }),
+      timeout: 20_000,
+      onAttempt: (attempt, totalAttempts, transport) => activeProgress.set(key, { key, stage: attempt > 1 ? 'fallback' : 'connecting', attempt, totalAttempts, startedAt, transport }),
     })
     let result = remote
     if (remote.code === 0) {
       const remoteCommit = remote.stdout.trim().split(/\s+/)[0]
       const local = await git(repository.path, ['rev-parse', `refs/remotes/origin/${repository.deployBranch}`])
       if (!remoteCommit || local.code !== 0 || local.stdout.trim() !== remoteCommit) {
-        result = await fetchDeploymentBranch(key, (attempt, totalAttempts) => activeProgress.set(key, { key, stage: 'fetching', attempt, totalAttempts, startedAt }))
+        result = await fetchDeploymentBranch(key, (attempt, totalAttempts, transport) => activeProgress.set(key, { key, stage: 'fetching', attempt, totalAttempts, startedAt, transport }))
       }
     }
     const checkedAt = new Date().toISOString()
     const message = result.code === 0 ? '' : remoteFailureMessage(result).slice(0, 300)
-    const fetchResult = { key, ok: result.code === 0, message, checkedAt }
+    const fetchResult = { key, ok: result.code === 0, message, checkedAt, transport: result.transport, elapsedMs: result.elapsedMs }
     await recordFetchResult(fetchResult)
     return fetchResult
   })()

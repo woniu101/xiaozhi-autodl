@@ -79,6 +79,8 @@ type RepositoryState = {
   remoteCheckedAt?: string
   remoteCheckOk?: boolean
   remoteCheckMessage?: string
+  remoteTransport?: 'direct' | 'autodl' | 'custom'
+  remoteElapsedMs?: number
   incomingCommits?: Array<{ commit: string; subject: string }>
   changedFiles?: string[]
   canFastForward?: boolean
@@ -86,7 +88,7 @@ type RepositoryState = {
   dependencyBlocked?: boolean
   affectedComponents?: string[]
 }
-type RepositoryCheckProgress = { key: string; stage: 'connecting' | 'retrying' | 'fetching'; attempt: number; totalAttempts: number; elapsedSeconds: number }
+type RepositoryCheckProgress = { key: string; stage: 'connecting' | 'fallback' | 'fetching'; attempt: number; totalAttempts: number; elapsedSeconds: number; transport?: 'direct' | 'autodl' | 'custom' }
 type UpdateOperation = {
   id: string
   repository: string
@@ -95,8 +97,17 @@ type UpdateOperation = {
   fromCommit?: string
   toCommit?: string
   components?: string[]
-  steps: Array<{ name: string; label: string; state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'; message?: string }>
+  startedAt: string
+  finishedAt?: string
+  steps: Array<{ name: string; label: string; state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'; message?: string; startedAt?: string; finishedAt?: string }>
   logs: string[]
+}
+type GitNetworkMode = 'auto' | 'direct' | 'autodl' | 'custom'
+type GitNetworkState = {
+  config: { mode: GitNetworkMode; customProxyConfigured: boolean; customProxyDisplay?: string }
+  autodlAvailable: boolean
+  lastResult?: { checkedAt: string; ok: boolean; transport?: 'direct' | 'autodl' | 'custom'; elapsedMs: number; message?: string }
+  test?: { ok: boolean; transport?: 'direct' | 'autodl' | 'custom'; elapsedMs: number; message: string }
 }
 
 const initialized = ref(false)
@@ -117,6 +128,13 @@ const currentPage = ref<'overview' | 'versions'>(window.location.pathname === '/
 const endpoints = ref<EndpointState>()
 const versionState = ref<{ inspectedAt: string; repositories: RepositoryState[] }>()
 const updateOperation = ref<UpdateOperation>()
+const updateHistoryItems = ref<UpdateOperation[]>([])
+const updateHistoryOpen = ref(false)
+const expandedUpdateId = ref('')
+const collapsedUpdateIds = reactive<Record<string, boolean>>({})
+const gitNetwork = ref<GitNetworkState>()
+const testingGitNetwork = ref(false)
+const gitNetworkDialog = reactive({ open: false, mode: 'auto' as GitNetworkMode, customProxy: '' })
 const checkingRepositories = ref<string[]>([])
 const repositoryProgress = ref<Record<string, RepositoryCheckProgress>>({})
 const updateTargets = reactive<Record<string, string>>({})
@@ -210,7 +228,7 @@ const selfVersionHealth = computed(() => {
   const version = overview.value?.release?.version ? `v${overview.value.release.version}` : '版本'
   if (updateOperation.value?.repository === 'xiaozhi-autodl' && updateOperation.value.state === 'running') return { tone: 'checking', text: version, detail: '升级中' }
   if (checkingRepositories.value.includes('xiaozhi-autodl')) return { tone: 'checking', text: version, detail: '检查中' }
-  if (repository?.remoteCheckOk === false) return { tone: 'failed', text: version, detail: '检查失败' }
+  if (repository?.remoteCheckOk === false) return { tone: 'warning', text: version, detail: '远端不可达' }
   if (repository?.updateAvailable) return { tone: 'available', text: version, detail: '可更新' }
   return { tone: repository?.remoteCheckedAt ? 'current' : 'unchecked', text: version, detail: '' }
 })
@@ -218,6 +236,21 @@ const systemDisk = computed(() => overview.value?.metrics?.disks?.find((item: an
 const dataDisk = computed(() => overview.value?.metrics?.disks?.find((item: any) => item.mount === '/root/autodl-tmp'))
 const gpu = computed(() => overview.value?.metrics?.gpu?.[0])
 const checkingVersions = computed(() => checkingRepositories.value.length > 0)
+const gitNetworkSummary = computed(() => {
+  const state = gitNetwork.value
+  if (!state) return { tone: 'unchecked', title: '尚未读取网络设置', detail: '自动选择连接线路' }
+  const modeLabels: Record<GitNetworkMode, string> = { auto: '自动选择', direct: '直接连接', autodl: 'AutoDL 学术加速', custom: '自定义代理' }
+  const transportLabels = { direct: '直连', autodl: 'AutoDL 学术加速', custom: '自定义代理' }
+  const last = state.lastResult
+  if (!last) return { tone: 'unchecked', title: modeLabels[state.config.mode], detail: state.config.mode === 'auto' ? '直连失败时自动回退到学术加速' : '尚未测试连接' }
+  return {
+    tone: last.ok ? 'current' : 'failed',
+    title: modeLabels[state.config.mode],
+    detail: last.ok
+      ? `最近通过 ${last.transport ? transportLabels[last.transport] : '所选线路'}连接 · ${(last.elapsedMs / 1000).toFixed(1)} 秒`
+      : `最近连接失败 · ${(last.elapsedMs / 1000).toFixed(1)} 秒`,
+  }
+})
 const endpointReadiness = computed(() => {
   const readiness = endpoints.value?.readiness
   if (!readiness) return { ready: endpoints.value?.gatewayReachable ? 1 : 0, total: 1, allReady: Boolean(endpoints.value?.gatewayReachable) }
@@ -368,6 +401,48 @@ const endpointModeLabels: Record<EndpointMode, string> = {
   autodl: 'AutoDL 公网',
   lan: '局域网 / SSH 隧道',
   custom: '自定义域名',
+}
+
+const gitTransportLabels = { direct: '直接连接', autodl: 'AutoDL 学术加速', custom: '自定义代理' }
+const repositoryLabels: Record<string, string> = { xiaozhi: 'xiaozhi-esp32-server', 'index-tts': 'index-tts', 'xiaozhi-autodl': 'xiaozhi-autodl' }
+
+function updateStateLabel(operation: UpdateOperation) {
+  return operation.state === 'running' ? '安全更新执行中'
+    : operation.state === 'done' ? '安全更新完成'
+      : operation.state === 'rolled-back' ? '更新失败，已自动回滚' : '安全更新失败'
+}
+
+function updateTone(operation: UpdateOperation) {
+  return operation.state === 'done' ? 'done' : operation.state === 'running' ? 'running' : 'failed'
+}
+
+function updateProgress(operation: UpdateOperation) {
+  const total = operation.steps.length || 1
+  const complete = operation.steps.filter((step) => ['done', 'failed', 'skipped'].includes(step.state)).length
+  return { complete, total, percent: Math.round(complete / total * 100) }
+}
+
+function elapsedLabel(start?: string, end?: string) {
+  if (!start) return '--'
+  const milliseconds = Math.max(0, new Date(end || Date.now()).getTime() - new Date(start).getTime())
+  if (!Number.isFinite(milliseconds)) return '--'
+  const seconds = Math.round(milliseconds / 1000)
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+}
+
+function isUpdateExpanded(operation: UpdateOperation) {
+  if (collapsedUpdateIds[operation.id]) return false
+  return operation.state !== 'done' || expandedUpdateId.value === operation.id
+}
+
+function collapseUpdate(operation: UpdateOperation) {
+  collapsedUpdateIds[operation.id] = true
+  if (expandedUpdateId.value === operation.id) expandedUpdateId.value = ''
+}
+
+function expandUpdate(operation: UpdateOperation) {
+  delete collapsedUpdateIds[operation.id]
+  expandedUpdateId.value = operation.id
 }
 
 function toast(text: string, kind = 'ok') {
@@ -706,7 +781,40 @@ function repositoryCheckLabel(repository: string) {
   const progress = repositoryProgress.value[repository]
   if (!progress) return '正在连接 GitHub…'
   if (progress.stage === 'fetching') return `正在获取更新 · ${progress.elapsedSeconds} 秒`
-  return `${progress.stage === 'retrying' ? '重试连接' : '连接 GitHub'} ${progress.attempt}/${progress.totalAttempts} · ${progress.elapsedSeconds} 秒`
+  if (progress.stage === 'fallback') return `切换 AutoDL 学术加速 · ${progress.elapsedSeconds} 秒`
+  const transport = progress.transport ? gitTransportLabels[progress.transport] : 'GitHub'
+  return `连接 ${transport} ${progress.attempt}/${progress.totalAttempts} · ${progress.elapsedSeconds} 秒`
+}
+
+async function loadGitNetwork(silent = false) {
+  try { gitNetwork.value = await api('/api/git-network') }
+  catch (error) { if (!silent) toast((error as Error).message, 'error') }
+}
+
+function openGitNetworkDialog() {
+  gitNetworkDialog.mode = gitNetwork.value?.config.mode || 'auto'
+  gitNetworkDialog.customProxy = ''
+  gitNetworkDialog.open = true
+}
+
+async function saveGitNetwork() {
+  busy.value = true
+  try {
+    gitNetwork.value = await api('/api/git-network', { method: 'PUT', body: JSON.stringify({ mode: gitNetworkDialog.mode, customProxy: gitNetworkDialog.customProxy || undefined }) })
+    gitNetworkDialog.open = false
+    toast('GitHub 网络策略已保存，仅影响 Git 操作')
+  } catch (error) { toast((error as Error).message, 'error') }
+  finally { busy.value = false }
+}
+
+async function testGitNetworkConnection() {
+  testingGitNetwork.value = true
+  try {
+    gitNetwork.value = await api('/api/git-network/test', { method: 'POST' })
+    const result = gitNetwork.value?.test
+    toast(result?.ok ? `${result.message} · ${result.transport ? gitTransportLabels[result.transport] : ''} · ${(result.elapsedMs / 1000).toFixed(1)} 秒` : result?.message || 'GitHub 连接失败', result?.ok ? 'ok' : 'error')
+  } catch (error) { toast((error as Error).message, 'error') }
+  finally { testingGitNetwork.value = false }
 }
 
 async function loadRepositoryProgress() {
@@ -753,6 +861,7 @@ async function checkVersions(repository?: string, silent = false) {
   finally {
     checkingRepositories.value = checkingRepositories.value.filter((item) => !targets.includes(item))
     stopRepositoryProgressPollingIfIdle()
+    await loadGitNetwork(true)
   }
 }
 
@@ -760,6 +869,7 @@ async function loadUpdateOperation(silent = true) {
   try {
     const data = await api('/api/updates/current')
     updateOperation.value = data.operation
+    updateHistoryItems.value = data.history || []
     if (data.operation && data.operation.state !== 'running' && loadedUpdateId !== data.operation.id) {
       loadedUpdateId = data.operation.id
       await loadVersions(true)
@@ -771,9 +881,17 @@ async function startUpdate(repository: string, targetRef: string) {
   busy.value = true
   try {
     updateOperation.value = await api(`/api/updates/${repository}`, { method: 'POST', body: JSON.stringify({ ref: targetRef }) })
+    if (updateOperation.value) expandUpdate(updateOperation.value)
     toast('安全更新已开始')
   } catch (error) { toast((error as Error).message, 'error') }
   finally { busy.value = false }
+}
+
+async function viewUpdateHistory(operation: UpdateOperation) {
+  updateOperation.value = operation
+  updateHistoryOpen.value = false
+  expandUpdate(operation)
+  await navigateToRepository(operation.repository)
 }
 
 function stopTimers() {
@@ -789,7 +907,7 @@ function stopTimers() {
 
 async function initializeDashboard() {
   stopTimers()
-  await Promise.all([refresh(), loadEndpoints(), loadVersions(), loadUpdateOperation()])
+  await Promise.all([refresh(), loadEndpoints(), loadVersions(), loadUpdateOperation(), loadGitNetwork()])
   const checkedTimes = versionState.value?.repositories.map((item) => item.remoteCheckedAt ? new Date(item.remoteCheckedAt).getTime() : 0) || []
   if (!checkedTimes.length || checkedTimes.some((value) => !value || Date.now() - value > 30 * 60 * 1000)) void checkVersions(undefined, true)
   refreshTimer = window.setInterval(() => { void refresh(true); void loadEndpoints(true); void loadUpdateOperation(true) }, 5000)
@@ -963,8 +1081,15 @@ onBeforeUnmount(() => {
     <main v-else class="dashboard-main version-page-main">
       <div class="version-page-heading">
         <div><button class="back-button" @click="navigate('overview')">← 返回运行总览</button><h1>代码版本管理</h1><p>检查 GitHub 远端、查看本地改动，并通过受保护流程更新运行版本。</p></div>
-        <button class="primary" :disabled="checkingVersions" @click="checkVersions()">{{ checkingVersions ? `正在检查 ${checkingRepositories.length} 个仓库…` : '↻ 检查全部仓库' }}</button>
+        <div class="version-page-actions"><button :disabled="!updateHistoryItems.length" @click="updateHistoryOpen = true">更新记录 {{ updateHistoryItems.length || '' }}</button><button class="primary" :disabled="checkingVersions" @click="checkVersions()">{{ checkingVersions ? `正在检查 ${checkingRepositories.length} 个仓库…` : '↻ 检查全部仓库' }}</button></div>
       </div>
+
+      <section :class="['git-network-panel', gitNetworkSummary.tone]">
+        <div class="git-network-icon">⇄</div>
+        <div class="git-network-copy"><b>GitHub 网络</b><strong>{{ gitNetworkSummary.title }}</strong><span>{{ gitNetworkSummary.detail }}</span><small v-if="gitNetwork?.config.mode === 'autodl'">仅在检查和更新仓库时使用，不会代理模型、语音或 Java 服务</small></div>
+        <span v-if="gitNetwork?.autodlAvailable" class="academic-available"><i></i>学术加速可用</span>
+        <div class="git-network-actions"><button :disabled="testingGitNetwork" @click="testGitNetworkConnection">{{ testingGitNetwork ? '测试中…' : '测试连接' }}</button><button class="primary subtle" @click="openGitNetworkDialog">网络设置</button></div>
+      </section>
 
       <section class="version-guide">
         <div><b>部署分支状态</b><span>小智仅比较 mvp，IndexTTS 与 xiaozhi-autodl 仅比较 main。</span></div>
@@ -973,7 +1098,7 @@ onBeforeUnmount(() => {
       </section>
 
       <section v-if="versionState" class="repository-grid">
-        <article v-for="repository in versionState.repositories" :id="`repository-${repository.key}`" :key="repository.key" :class="['repository-card', { 'self-repository': repository.key === 'xiaozhi-autodl', 'has-update-detail': updateOperation?.repository === repository.key }]">
+        <article v-for="repository in versionState.repositories" :id="`repository-${repository.key}`" :key="repository.key" :class="['repository-card', { 'self-repository': repository.key === 'xiaozhi-autodl', 'has-update-detail': updateOperation?.repository === repository.key && updateOperation && isUpdateExpanded(updateOperation) }]">
           <header>
             <div><span class="repository-icon">{{ repository.key === 'xiaozhi' ? 'X' : repository.key === 'index-tts' ? 'I' : 'A' }}</span><div><h2>{{ repository.label }}</h2><a v-if="repository.remoteUrl" :href="repository.remoteUrl" target="_blank">{{ repository.remoteUrl }} ↗</a></div></div>
             <span :class="['remote-status', remoteVersionTone(repository)]"><i></i>{{ remoteVersionLabel(repository) }}</span>
@@ -990,7 +1115,7 @@ onBeforeUnmount(() => {
 
           <div v-if="repository.remoteCheckOk === false" class="remote-check-error">
             <div><b>远端检查失败</b><span>{{ repository.remoteCheckMessage || '未获得具体错误信息' }}</span></div>
-            <button :disabled="isRepositoryChecking(repository.key)" @click="checkVersions(repository.key)">重新检查</button>
+            <div class="remote-error-actions"><button @click="openGitNetworkDialog">网络设置</button><button :disabled="isRepositoryChecking(repository.key)" @click="checkVersions(repository.key)">重新检查</button></div>
           </div>
 
           <div class="commit-card"><span>当前提交说明</span><strong>{{ repository.subject || '暂无提交说明' }}</strong><small>{{ fmtDate(repository.committedAt) }}</small></div>
@@ -1021,16 +1146,23 @@ onBeforeUnmount(() => {
             </div>
           </footer>
 
-          <section v-if="updateOperation?.repository === repository.key" :class="['update-detail', updateOperation.state]">
+          <div v-if="updateOperation?.repository === repository.key && !isUpdateExpanded(updateOperation)" :class="['update-summary', updateTone(updateOperation)]">
+            <span class="update-summary-icon">{{ updateOperation.state === 'done' ? '✓' : updateOperation.state === 'running' ? '↻' : '!' }}</span>
+            <div><b>{{ repository.label }} · {{ updateStateLabel(updateOperation) }}</b><span>{{ updateOperation.message || `${updateOperation.fromCommit || '当前版本'} → ${updateOperation.toCommit || '远端版本'}` }}</span></div>
+            <small>{{ elapsedLabel(updateOperation.startedAt, updateOperation.finishedAt) }} · {{ fmtShortDate(updateOperation.finishedAt || updateOperation.startedAt) }}</small>
+            <button @click="expandUpdate(updateOperation)">查看详情</button>
+          </div>
+
+          <section v-if="updateOperation?.repository === repository.key && isUpdateExpanded(updateOperation)" :class="['update-detail', updateOperation.state]">
             <header>
               <div>
-                <h2>{{ repository.label }} · {{ updateOperation.state === 'running' ? '安全更新执行中' : updateOperation.state === 'done' ? '安全更新完成' : updateOperation.state === 'rolled-back' ? '更新失败，已自动回滚' : '安全更新失败' }}</h2>
+                <h2>{{ repository.label }} · {{ updateStateLabel(updateOperation) }}</h2>
                 <p>{{ updateOperation.message || '正在执行受保护更新流程' }}</p>
               </div>
-              <code>{{ updateOperation.fromCommit || '当前版本' }} → {{ updateOperation.toCommit || '远端版本' }}</code>
+              <div class="update-detail-meta"><span>{{ updateProgress(updateOperation).complete }}/{{ updateProgress(updateOperation).total }} 步 · {{ elapsedLabel(updateOperation.startedAt, updateOperation.finishedAt) }}</span><code>{{ updateOperation.fromCommit || '当前版本' }} → {{ updateOperation.toCommit || '远端版本' }}</code><button v-if="updateOperation.state !== 'running'" @click="collapseUpdate(updateOperation)">{{ updateOperation.state === 'done' ? '收起' : '确认并收起' }}</button></div>
             </header>
             <ol><li v-for="step in updateOperation.steps" :key="step.name" :class="step.state"><i></i><span>{{ step.label }}</span><small>{{ step.message }}</small></li></ol>
-            <pre>{{ updateOperation.logs.join('\n') || '等待更新日志…' }}</pre>
+            <details class="update-log-block" :open="updateOperation.state !== 'done'"><summary>执行日志 · {{ updateOperation.logs.length }} 行</summary><pre>{{ updateOperation.logs.join('\n') || '等待更新日志…' }}</pre></details>
           </section>
         </article>
       </section>
@@ -1084,6 +1216,39 @@ onBeforeUnmount(() => {
         </template>
         <div class="dialog-actions"><button type="button" @click="endpointDialog.open = false">取消</button><button class="primary" :disabled="busy">保存并同步</button></div>
       </form>
+    </div>
+
+    <div v-if="gitNetworkDialog.open" class="modal-mask" @click.self="gitNetworkDialog.open = false">
+      <form class="dialog-card git-network-dialog" @submit.prevent="saveGitNetwork">
+        <div><h2>GitHub 网络设置</h2><button type="button" class="close-button" @click="gitNetworkDialog.open = false">×</button></div>
+        <p>设置只注入代码检查和更新使用的 Git 子进程，不会改变系统全局代理，也不会影响 DeepSeek、IndexTTS 或其他服务。</p>
+        <div class="network-mode-options">
+          <label :class="{ active: gitNetworkDialog.mode === 'auto' }"><input v-model="gitNetworkDialog.mode" type="radio" value="auto" /><span><b>自动选择（推荐）</b><small>先直连 5 秒，失败后回退 AutoDL 学术加速</small></span></label>
+          <label :class="{ active: gitNetworkDialog.mode === 'direct' }"><input v-model="gitNetworkDialog.mode" type="radio" value="direct" /><span><b>仅直接连接</b><small>不读取终端代理和 AutoDL 加速设置</small></span></label>
+          <label :class="{ active: gitNetworkDialog.mode === 'autodl', disabled: !gitNetwork?.autodlAvailable }"><input v-model="gitNetworkDialog.mode" type="radio" value="autodl" :disabled="!gitNetwork?.autodlAvailable" /><span><b>AutoDL 学术加速</b><small>{{ gitNetwork?.autodlAvailable ? '读取 /etc/network_turbo，仅用于学术资源连接' : '当前实例未提供 /etc/network_turbo' }}</small></span></label>
+          <label :class="{ active: gitNetworkDialog.mode === 'custom' }"><input v-model="gitNetworkDialog.mode" type="radio" value="custom" /><span><b>自定义代理</b><small>适合 SSH 反向隧道或你自己的 HTTP / SOCKS5 代理</small></span></label>
+        </div>
+        <template v-if="gitNetworkDialog.mode === 'custom'">
+          <label>代理地址</label>
+          <input v-model.trim="gitNetworkDialog.customProxy" :placeholder="gitNetwork?.config.customProxyConfigured ? `已保存 ${gitNetwork.config.customProxyDisplay || '代理'}；留空保持不变` : '例如 http://127.0.0.1:7890'" autocomplete="off" />
+        </template>
+        <div class="academic-notice"><b>使用提示</b><span>AutoDL 学术加速适合 GitHub 等学术资源，但官方不保证稳定性；自动模式会把它作为回退线路，并在 Git 操作结束后立即失效。</span></div>
+        <div class="dialog-actions"><button type="button" @click="gitNetworkDialog.open = false">取消</button><button class="primary" :disabled="busy">保存网络策略</button></div>
+      </form>
+    </div>
+
+    <div v-if="updateHistoryOpen" class="modal-mask" @click.self="updateHistoryOpen = false">
+      <div class="dialog-card update-history-dialog" role="dialog" aria-modal="true">
+        <div><h2>最近更新记录</h2><button class="close-button" @click="updateHistoryOpen = false">×</button></div>
+        <p>最多保留最近 10 次受保护更新。成功记录只保留摘要，失败记录可重新打开排查。</p>
+        <div class="update-history-list">
+          <button v-for="item in updateHistoryItems" :key="item.id" :class="['update-history-item', updateTone(item)]" @click="viewUpdateHistory(item)">
+            <i>{{ item.state === 'done' ? '✓' : item.state === 'running' ? '↻' : '!' }}</i>
+            <span><b>{{ repositoryLabels[item.repository] || item.repository }}</b><small>{{ updateStateLabel(item) }} · {{ item.message || `${item.fromCommit || '--'} → ${item.toCommit || '--'}` }}</small></span>
+            <em>{{ elapsedLabel(item.startedAt, item.finishedAt) }}<small>{{ fmtShortDate(item.finishedAt || item.startedAt) }}</small></em>
+          </button>
+        </div>
+      </div>
     </div>
 
     <div v-if="confirmBox.open" class="modal-mask" @click.self="confirmBox.open = false">

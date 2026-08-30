@@ -8,7 +8,7 @@ import { run } from './process.js'
 import { affectedComponentsForFiles, fetchDeploymentBranch, git, isRepositoryKey, REPOSITORIES, repositoryState, type RepositoryKey } from './versions.js'
 
 type UpdateState = 'running' | 'done' | 'failed' | 'rolled-back'
-type UpdateStep = { name: string; label: string; state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'; message?: string }
+type UpdateStep = { name: string; label: string; state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'; message?: string; startedAt?: string; finishedAt?: string }
 
 export interface UpdateOperation {
   id: string
@@ -28,6 +28,7 @@ export interface UpdateOperation {
 
 const supervisorctl = '/root/miniconda3/bin/supervisorctl'
 const updateStatePath = resolve(RUNTIME_ROOT, 'run/update-operation.json')
+const updateHistoryPath = resolve(RUNTIME_ROOT, 'run/update-history.json')
 let currentUpdate: UpdateOperation | undefined
 
 async function persistUpdate(operation: UpdateOperation) {
@@ -40,6 +41,19 @@ async function persistUpdate(operation: UpdateOperation) {
 async function persistedUpdate(): Promise<UpdateOperation | undefined> {
   try { return JSON.parse(await readFile(updateStatePath, 'utf8')) as UpdateOperation }
   catch { return undefined }
+}
+
+export async function updateHistory(): Promise<UpdateOperation[]> {
+  try { return JSON.parse(await readFile(updateHistoryPath, 'utf8')) as UpdateOperation[] }
+  catch { return [] }
+}
+
+async function archiveUpdate(operation: UpdateOperation) {
+  const existing = (await updateHistory()).filter((item) => item.id !== operation.id)
+  const history = [{ ...operation }, ...existing].slice(0, 10)
+  const temporary = `${updateHistoryPath}.${process.pid}.${crypto.randomUUID()}.tmp`
+  await writeFile(temporary, `${JSON.stringify(history, null, 2)}\n`, { mode: 0o600 })
+  await rename(temporary, updateHistoryPath)
 }
 
 function processRunning(pid?: number): boolean {
@@ -130,6 +144,7 @@ async function executeUpdate(operation: UpdateOperation) {
     for (const program of programs) runtimeStates[program] = await supervisorState(program)
     for (const step of operation.steps) {
       step.state = 'running'
+      step.startedAt = new Date().toISOString()
       await persistUpdate(operation)
       if (step.name === 'preflight') {
         const state = await repositoryState(operation.repository)
@@ -140,7 +155,8 @@ async function executeUpdate(operation: UpdateOperation) {
         addLog(operation, `预检通过，当前版本 ${state.shortCommit}`)
       } else if (step.name === 'fetch') {
         const fetched = await fetchDeploymentBranch(operation.repository)
-        if (fetched.code !== 0) throw new Error((fetched.stderr || '拉取远端元数据失败').trim())
+        if (fetched.code !== 0) throw new Error((fetched.timedOut ? `GitHub 连接超时（已尝试 ${fetched.attempts} 条线路）` : fetched.stderr || fetched.errorMessage || '拉取远端元数据失败').trim())
+        addLog(operation, `GitHub 元数据已通过 ${fetched.transport === 'autodl' ? 'AutoDL 学术加速' : fetched.transport === 'custom' ? '自定义代理' : '直接连接'}获取`)
         const state = await repositoryState(operation.repository)
         const targetRef = operation.targetRef || state.upstream
         if (!targetRef || !state.refs?.includes(targetRef)) throw new Error('目标版本不是允许的远端部署分支')
@@ -153,6 +169,7 @@ async function executeUpdate(operation: UpdateOperation) {
           step.message = '已经是远端最新版本'
           addLog(operation, step.message)
           step.state = 'done'
+          step.finishedAt = new Date().toISOString()
           for (const later of operation.steps.slice(operation.steps.indexOf(step) + 1)) later.state = 'skipped'
           operation.state = 'done'
           operation.message = '已经是远端最新版本'
@@ -192,6 +209,7 @@ async function executeUpdate(operation: UpdateOperation) {
         addLog(operation, '原运行服务均已通过端口就绪检查')
       }
       step.state = 'done'
+      step.finishedAt = new Date().toISOString()
       await persistUpdate(operation)
     }
     operation.state = 'done'
@@ -199,7 +217,11 @@ async function executeUpdate(operation: UpdateOperation) {
   } catch (error) {
     const message = error instanceof Error ? error.message : '更新失败'
     const runningStep = operation.steps.find((step) => step.state === 'running')
-    if (runningStep) runningStep.state = 'failed'
+    if (runningStep) {
+      runningStep.state = 'failed'
+      runningStep.finishedAt = new Date().toISOString()
+      runningStep.message = message
+    }
     addLog(operation, message)
     if (changedSource && oldCommit) {
       addLog(operation, `开始回滚到 ${oldCommit.slice(0, 10)}`)
@@ -221,7 +243,18 @@ async function executeUpdate(operation: UpdateOperation) {
   } finally {
     operation.finishedAt = new Date().toISOString()
     await persistUpdate(operation)
+    try { await archiveUpdate(operation) }
+    catch (error) { addLog(operation, `更新历史写入失败：${error instanceof Error ? error.message : error}`); await persistUpdate(operation) }
   }
+}
+
+function stepsForRepository(repository: RepositoryKey): UpdateStep[] {
+  const labels = repository === 'xiaozhi'
+    ? ['安全预检', '获取 mvp', '快进源码', '构建受影响组件', '刷新服务并验收']
+    : repository === 'index-tts'
+      ? ['安全预检', '获取 main', '快进源码', '刷新 IndexTTS', '等待模型与健康验收']
+      : ['安全预检', '获取 main', '快进源码', '安装依赖并构建', '重启 Dashboard 并验收']
+  return ['preflight', 'fetch', 'install', 'build', 'verify'].map((name, index) => ({ name, label: labels[index], state: 'pending' }))
 }
 
 export async function startSafeUpdate(repository: string, targetRef?: string): Promise<UpdateOperation> {
@@ -234,13 +267,7 @@ export async function startSafeUpdate(repository: string, targetRef?: string): P
     targetRef: targetRef?.trim() || undefined,
     state: 'running',
     startedAt: new Date().toISOString(),
-    steps: [
-      { name: 'preflight', label: '安全预检', state: 'pending' },
-      { name: 'fetch', label: '检查远端', state: 'pending' },
-      { name: 'install', label: '快进源码', state: 'pending' },
-      { name: 'build', label: '构建与替换', state: 'pending' },
-      { name: 'verify', label: '重启与验收', state: 'pending' },
-    ],
+    steps: stepsForRepository(repository),
     logs: [],
   }
   await persistUpdate(operation)

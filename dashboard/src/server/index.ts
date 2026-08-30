@@ -24,7 +24,8 @@ import { systemMetrics } from './system.js'
 import { releaseInfo } from './release.js'
 import { endpointState, saveEndpointConfig, syncClientEndpoints, type EndpointConfig } from './endpoints.js'
 import { checkRepositoryUpdates, repositoryCheckProgress, startAutomaticVersionChecks, versionState } from './versions.js'
-import { currentSafeUpdate, startSafeUpdate } from './updater.js'
+import { currentSafeUpdate, startSafeUpdate, updateHistory } from './updater.js'
+import { gitNetworkState, saveGitNetworkConfig, testGitNetwork, type GitNetworkConfig } from './git-network.js'
 import {
   actOnService,
   getCurrentOperation,
@@ -185,7 +186,28 @@ app.post('/api/versions/check', async (request, reply) => {
   catch (error) { return reply.code(500).send({ error: error instanceof Error ? error.message : '更新检测失败' }) }
 })
 
-app.get('/api/updates/current', async () => ({ operation: await currentSafeUpdate() }))
+app.get('/api/git-network', async () => gitNetworkState())
+
+app.put('/api/git-network', async (request, reply) => {
+  try {
+    await saveGitNetworkConfig(request.body as Partial<GitNetworkConfig>)
+    return await gitNetworkState()
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'GitHub 网络配置保存失败' }) }
+})
+
+app.post('/api/git-network/test', async (_request, reply) => {
+  try { return await testGitNetwork() }
+  catch (error) { return reply.code(500).send({ error: error instanceof Error ? error.message : 'GitHub 连接测试失败' }) }
+})
+
+app.get('/api/updates/current', async () => {
+  const operation = await currentSafeUpdate()
+  const history = await updateHistory()
+  const mergedHistory = operation && operation.state !== 'running' && !history.some((item) => item.id === operation.id)
+    ? [operation, ...history].slice(0, 10)
+    : history
+  return { operation, history: mergedHistory }
+})
 
 app.post('/api/updates/:repository', async (request, reply) => {
   const { repository } = request.params as { repository: string }
