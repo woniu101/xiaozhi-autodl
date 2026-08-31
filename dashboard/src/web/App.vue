@@ -1220,20 +1220,54 @@ onBeforeUnmount(() => {
 
     <div v-if="gitNetworkDialog.open" class="modal-mask" @click.self="gitNetworkDialog.open = false">
       <form class="dialog-card git-network-dialog" @submit.prevent="saveGitNetwork">
-        <div><h2>GitHub 网络设置</h2><button type="button" class="close-button" @click="gitNetworkDialog.open = false">×</button></div>
-        <p>设置只注入代码检查和更新使用的 Git 子进程，不会改变系统全局代理，也不会影响 DeepSeek、IndexTTS 或其他服务。</p>
-        <div class="network-mode-options">
-          <label :class="{ active: gitNetworkDialog.mode === 'auto' }"><input v-model="gitNetworkDialog.mode" type="radio" value="auto" /><span><b>自动选择（推荐）</b><small>先直连 5 秒，失败后回退 AutoDL 学术加速</small></span></label>
-          <label :class="{ active: gitNetworkDialog.mode === 'direct' }"><input v-model="gitNetworkDialog.mode" type="radio" value="direct" /><span><b>仅直接连接</b><small>不读取终端代理和 AutoDL 加速设置</small></span></label>
-          <label :class="{ active: gitNetworkDialog.mode === 'autodl', disabled: !gitNetwork?.autodlAvailable }"><input v-model="gitNetworkDialog.mode" type="radio" value="autodl" :disabled="!gitNetwork?.autodlAvailable" /><span><b>AutoDL 学术加速</b><small>{{ gitNetwork?.autodlAvailable ? '读取 /etc/network_turbo，仅用于学术资源连接' : '当前实例未提供 /etc/network_turbo' }}</small></span></label>
-          <label :class="{ active: gitNetworkDialog.mode === 'custom' }"><input v-model="gitNetworkDialog.mode" type="radio" value="custom" /><span><b>自定义代理</b><small>适合 SSH 反向隧道或你自己的 HTTP / SOCKS5 代理</small></span></label>
+        <div class="network-dialog-header">
+          <span class="network-dialog-icon">⇄</span>
+          <div><h2>GitHub 网络设置</h2><p>为代码检查与安全更新选择连接线路</p></div>
+          <button type="button" class="close-button" aria-label="关闭" @click="gitNetworkDialog.open = false">×</button>
         </div>
-        <template v-if="gitNetworkDialog.mode === 'custom'">
-          <label>代理地址</label>
-          <input v-model.trim="gitNetworkDialog.customProxy" :placeholder="gitNetwork?.config.customProxyConfigured ? `已保存 ${gitNetwork.config.customProxyDisplay || '代理'}；留空保持不变` : '例如 http://127.0.0.1:7890'" autocomplete="off" />
-        </template>
-        <div class="academic-notice"><b>使用提示</b><span>AutoDL 学术加速适合 GitHub 等学术资源，但官方不保证稳定性；自动模式会把它作为回退线路，并在 Git 操作结束后立即失效。</span></div>
-        <div class="dialog-actions"><button type="button" @click="gitNetworkDialog.open = false">取消</button><button class="primary" :disabled="busy">保存网络策略</button></div>
+
+        <div :class="['network-current', gitNetworkSummary.tone]">
+          <div><small>当前策略</small><strong>{{ gitNetworkSummary.title }}</strong></div>
+          <span><i></i>{{ gitNetworkSummary.detail }}</span>
+        </div>
+
+        <fieldset class="network-mode-fieldset">
+          <legend>选择连接方式</legend>
+          <div class="network-mode-options">
+            <label :class="{ active: gitNetworkDialog.mode === 'auto' }">
+              <input v-model="gitNetworkDialog.mode" type="radio" value="auto" />
+              <span class="network-choice-icon auto">A</span>
+              <span class="network-choice-copy"><b>自动选择 <em>推荐</em></b><small>先尝试直连，5 秒无响应后自动切换学术加速</small><mark>适合镜像发布与日常使用</mark></span>
+              <span class="network-choice-check">✓</span>
+            </label>
+            <label :class="{ active: gitNetworkDialog.mode === 'direct' }">
+              <input v-model="gitNetworkDialog.mode" type="radio" value="direct" />
+              <span class="network-choice-icon direct">↗</span>
+              <span class="network-choice-copy"><b>仅直接连接</b><small>不读取终端代理，也不启用 AutoDL 学术加速</small><mark>网络可直达 GitHub 时使用</mark></span>
+              <span class="network-choice-check">✓</span>
+            </label>
+            <label :class="{ active: gitNetworkDialog.mode === 'autodl', disabled: !gitNetwork?.autodlAvailable }">
+              <input v-model="gitNetworkDialog.mode" type="radio" value="autodl" :disabled="!gitNetwork?.autodlAvailable" />
+              <span class="network-choice-icon autodl">⚡</span>
+              <span class="network-choice-copy"><b>AutoDL 学术加速 <em :class="gitNetwork?.autodlAvailable ? 'available' : 'unavailable'">{{ gitNetwork?.autodlAvailable ? '当前可用' : '不可用' }}</em></b><small>读取 /etc/network_turbo，仅用于 GitHub 连接</small><mark>不保证长期稳定，适合作为回退</mark></span>
+              <span class="network-choice-check">✓</span>
+            </label>
+            <label :class="{ active: gitNetworkDialog.mode === 'custom' }">
+              <input v-model="gitNetworkDialog.mode" type="radio" value="custom" />
+              <span class="network-choice-icon custom">⌁</span>
+              <span class="network-choice-copy"><b>自定义代理</b><small>使用 SSH 反向隧道或自己的 HTTP / SOCKS5 代理</small><mark>{{ gitNetwork?.config.customProxyConfigured ? '已有代理配置' : '适合本机代理开发环境' }}</mark></span>
+              <span class="network-choice-check">✓</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div v-if="gitNetworkDialog.mode === 'custom'" class="network-proxy-field">
+          <label for="git-custom-proxy"><span>代理地址</span><small>支持 HTTP、HTTPS、SOCKS5 与 SOCKS5H</small></label>
+          <input id="git-custom-proxy" v-model.trim="gitNetworkDialog.customProxy" :placeholder="gitNetwork?.config.customProxyConfigured ? `已保存 ${gitNetwork.config.customProxyDisplay || '代理'}；留空保持不变` : '例如 http://127.0.0.1:7890'" autocomplete="off" />
+        </div>
+
+        <div class="network-scope-notice"><span>i</span><div><b>只影响 Git 操作</b><p>策略仅注入检查仓库和更新源码的 Git 子进程，不会修改系统全局代理，也不会影响 AutoDL 公网域名、DeepSeek、Codex、IndexTTS 或其他服务。</p></div></div>
+        <div class="dialog-actions network-dialog-actions"><button type="button" @click="gitNetworkDialog.open = false">取消</button><button class="primary" :disabled="busy">{{ busy ? '正在保存…' : '保存网络策略' }}</button></div>
       </form>
     </div>
 
