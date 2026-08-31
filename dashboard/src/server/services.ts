@@ -7,7 +7,7 @@ import { observeStability, serviceSignals } from './service-metrics.js'
 
 export type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
 export type LogLevel = 'all' | 'info' | 'warn' | 'error'
-export type LogSource = 'service' | 'access' | 'error'
+export type LogSource = 'service' | 'access' | 'error' | 'raw' | 'slow'
 export type LogPreset = 'http-errors' | 'manager-requests'
 
 export interface ServiceActions {
@@ -138,7 +138,10 @@ async function health(url?: string): Promise<{ ok: boolean; status?: number; lat
   if (!url) return { ok: true }
   const started = performance.now()
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(1_500) })
+    const response = await fetch(url, {
+      headers: { 'x-xiaozhi-health-probe': '1' },
+      signal: AbortSignal.timeout(1_500),
+    })
     return { ok: response.ok, status: response.status, latencyMs: Math.round(performance.now() - started) }
   } catch {
     return { ok: false, latencyMs: Math.round(performance.now() - started) }
@@ -219,20 +222,24 @@ async function performServiceAction(name: ServiceName, action: ServiceAction) {
     if (action === 'restart' && !running) throw new ServiceOperationConflict(`${config.label} 当前未运行，请使用启动`)
   }
 
-  let result
+  let result: Awaited<ReturnType<typeof run>>
   if (config.supervisor) {
     result = await run('/root/miniconda3/bin/supervisorctl', ['-c', SUPERVISOR_CONFIG, action, name], 30_000)
-  } else if (name === 'redis' && (action === 'stop' || action === 'restart')) {
-    result = await run('/usr/bin/redis-cli', ['SHUTDOWN', 'SAVE'], 20_000)
-    if (result.code !== 0 && await systemServiceRunning('redis')) {
-      throw new Error((result.stderr || result.stdout || 'Redis 安全停止失败').trim())
-    }
-    if (action === 'restart') {
-      await waitFor('redis', false)
-      result = await run('/usr/sbin/service', ['redis-server', 'start'], 30_000)
+  } else if (name === 'redis') {
+    if (action === 'start') {
+      result = await run('/root/xiaozhi-autodl/bin/start-redis', [], 30_000)
+    } else {
+      result = await run('/usr/bin/redis-cli', ['SHUTDOWN', 'SAVE'], 20_000)
+      if (result.code !== 0 && await systemServiceRunning('redis')) {
+        throw new Error((result.stderr || result.stdout || 'Redis 安全停止失败').trim())
+      }
+      if (action === 'restart') {
+        await waitFor('redis', false)
+        result = await run('/root/xiaozhi-autodl/bin/start-redis', [], 30_000)
+      }
     }
   } else {
-    result = await run('/usr/sbin/service', [name === 'redis' ? 'redis-server' : name, action], 30_000)
+    result = await run('/usr/sbin/service', [name, action], 30_000)
   }
   if (result.code !== 0) throw new Error((result.stderr || result.stdout || '操作失败').trim())
   return { message: (result.stdout || `${config.label} ${action} 完成`).trim() }
@@ -258,14 +265,29 @@ export async function actOnService(name: ServiceName, action: ServiceAction) {
 function logPath(name: ServiceName, source: LogSource): string {
   if (source === 'access' && (name === 'web-gateway' || name === 'manager-api')) return resolve(RUNTIME_ROOT, 'logs/nginx-access.log')
   if (source === 'error' && name === 'web-gateway') return resolve(RUNTIME_ROOT, 'logs/nginx-error.log')
+  if (source === 'error' && name === 'mysql') return resolve(RUNTIME_ROOT, 'logs/mysql/error.log')
+  if (source === 'slow' && name === 'mysql') return resolve(RUNTIME_ROOT, 'logs/mysql/slow.log')
   return SERVICES[name].log
 }
 
 function effectiveSource(name: ServiceName, source?: LogSource): LogSource {
+  if (source === 'raw' && (name === 'index-tts' || name === 'xiaozhi-server')) return source
   if (source === 'access' && (name === 'web-gateway' || name === 'manager-api')) return source
   if (source === 'error' && name === 'web-gateway') return source
+  if ((source === 'error' || source === 'slow') && name === 'mysql') return source
   if (!source && name === 'web-gateway') return 'access'
   return 'service'
+}
+
+export function isRoutineServiceLine(name: ServiceName, source: LogSource, line: string): boolean {
+  if (source !== 'service') return false
+  if (name === 'index-tts') {
+    return /"GET \/(?:health\/(?:live|ready)|internal\/metrics) HTTP\/1\.[01]" 200 OK/.test(line)
+  }
+  if (name === 'xiaozhi-server') {
+    return /^curl: \(7\) Failed to connect to 127\.0\.0\.1 port 8002\b/.test(line)
+  }
+  return false
 }
 
 function matchesPreset(line: string, preset?: LogPreset): boolean {
@@ -296,7 +318,8 @@ export async function serviceLogs(name: ServiceName, options: { lines: number; l
     const content = stripAnsi(redact(await readTail(path, 4 * 1024 * 1024)))
     const level = options.level || 'all'
     const keyword = options.keyword?.trim().toLocaleLowerCase()
-    const filtered = filterWithErrorContext(content.split('\n'), level)
+    const visibleLines = content.split('\n').filter((line) => !isRoutineServiceLine(name, source, line))
+    const filtered = filterWithErrorContext(visibleLines, level)
       .filter((line) => matchesPreset(line, options.preset) && (!keyword || line.toLocaleLowerCase().includes(keyword)))
     return { path, source, content: filtered.slice(-options.lines).join('\n') }
   } catch (error) {

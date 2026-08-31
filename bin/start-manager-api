@@ -15,4 +15,7 @@ done
 [[ "$redis_ready" == true ]] || { echo 'Redis 尚未通过 PING 健康检查' >&2; exit 1; }
 
 export CHARACTER_STYLE_DIR=/root/xiaozhi-esp32-server/main/xiaozhi-server/data/character_styles
-exec /usr/bin/java -Xms256m -Xmx1536m -jar "$jar" --spring.profiles.active=dev --server.address=127.0.0.1
+exec /usr/bin/java -Xms256m -Xmx1536m -jar "$jar" \
+  --spring.profiles.active=dev \
+  --server.address=127.0.0.1 \
+  --logging.config=/root/xiaozhi-autodl/config/logback-autodl.xml

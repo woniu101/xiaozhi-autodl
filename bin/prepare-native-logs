@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=/root/xiaozhi-autodl
+runtime=/root/autodl-tmp/xiaozhi-autodl
+log_group=xiaozhi-logs
+
+for dependency in /usr/sbin/groupadd /usr/sbin/usermod /usr/sbin/logrotate /usr/sbin/cron /usr/bin/flock; do
+  [[ -x "$dependency" ]] || { echo "日志依赖不存在：$dependency" >&2; exit 1; }
+done
+
+if ! getent group "$log_group" >/dev/null; then
+  /usr/sbin/groupadd --system "$log_group"
+fi
+for account in mysql redis; do
+  if id "$account" >/dev/null 2>&1 && ! id -nG "$account" | tr ' ' '\n' | grep -Fxq "$log_group"; then
+    /usr/sbin/usermod -a -G "$log_group" "$account"
+  fi
+done
+
+# 只向 mysql/redis 专用组开放路径穿越权限，不开放 /root 的目录读取权限。
+chgrp "$log_group" /root "$runtime" "$runtime/logs"
+chmod 0710 /root
+chmod 0710 "$runtime" "$runtime/logs"
+
+install -d -o mysql -g adm -m 0750 "$runtime/logs/mysql"
+install -d -o redis -g adm -m 2750 "$runtime/logs/redis"
+install -d -o root -g root -m 0750 "$runtime/logs/archive"
+if [[ -e /etc/mysql/mysql.conf.d/99-xiaozhi-autodl.cnf ]]; then
+  rm -f /etc/mysql/mysql.conf.d/99-xiaozhi-autodl.cnf
+fi
+install -D -o root -g root -m 0644 "$root/config/mysql/zz-xiaozhi-autodl.cnf" /etc/mysql/mysql.conf.d/zz-xiaozhi-autodl.cnf
+install -D -o root -g root -m 0644 "$root/config/logrotate/xiaozhi-autodl" /etc/logrotate.d/xiaozhi-autodl
+install -D -o root -g root -m 0644 "$root/config/cron/xiaozhi-autodl-logrotate" /etc/cron.d/xiaozhi-autodl-logrotate

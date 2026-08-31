@@ -18,7 +18,7 @@ type Service = {
   healthStatus?: number
   healthLatencyMs?: number
   stability?: { restartCount10m: number; lastStartedAt?: string }
-  signals?: Array<{ label: string; value: string; tone: 'normal' | 'info' | 'warning' | 'critical' | 'muted'; logLevel?: string; logKeyword?: string; logSource?: 'service' | 'access' | 'error'; logPreset?: 'http-errors' | 'manager-requests' }>
+  signals?: Array<{ label: string; value: string; tone: 'normal' | 'info' | 'warning' | 'critical' | 'muted'; logLevel?: string; logKeyword?: string; logSource?: 'service' | 'access' | 'error' | 'raw' | 'slow'; logPreset?: 'http-errors' | 'manager-requests' }>
   lastError?: string
   activeAction?: 'start' | 'stop' | 'restart'
   allowedActions?: { start: boolean; stop: boolean; restart: boolean }
@@ -157,7 +157,7 @@ const logs = reactive({
   lines: 200,
   level: 'all',
   keyword: '',
-  source: 'service' as 'service' | 'access' | 'error',
+  source: 'service' as 'service' | 'access' | 'error' | 'raw' | 'slow',
   preset: '' as '' | 'http-errors' | 'manager-requests',
   presetLabel: '',
   follow: true,
@@ -279,6 +279,10 @@ const logSourceOptions = computed(() => logs.service === 'web-gateway'
   ? [{ value: 'access', label: '访问日志' }, { value: 'error', label: '错误日志' }, { value: 'service', label: '启动日志' }]
   : logs.service === 'manager-api'
     ? [{ value: 'service', label: '应用日志' }, { value: 'access', label: '接口访问日志' }]
+    : logs.service === 'index-tts' || logs.service === 'xiaozhi-server'
+      ? [{ value: 'service', label: '业务日志' }, { value: 'raw', label: '原始日志' }]
+      : logs.service === 'mysql'
+        ? [{ value: 'error', label: '错误日志' }, { value: 'slow', label: '慢查询日志' }]
     : [{ value: 'service', label: '服务日志' }])
 const logDownloadUrl = computed(() => {
   const query = new URLSearchParams({ lines: String(logs.lines), level: logs.level, keyword: logs.keyword, source: logs.source, preset: logs.preset })
@@ -631,7 +635,7 @@ async function showLogs(service: Service) {
   logs.lines = 200
   logs.level = 'all'
   logs.keyword = ''
-  logs.source = service.name === 'web-gateway' ? 'access' : 'service'
+  logs.source = service.name === 'web-gateway' ? 'access' : service.name === 'mysql' ? 'error' : 'service'
   logs.preset = ''
   logs.presetLabel = ''
   logs.error = ''

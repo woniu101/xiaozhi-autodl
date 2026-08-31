@@ -11,7 +11,7 @@ export interface ServiceSignal {
   tone: SignalTone
   logLevel?: 'all' | 'info' | 'warn' | 'error'
   logKeyword?: string
-  logSource?: 'service' | 'access' | 'error'
+  logSource?: 'service' | 'access' | 'error' | 'raw' | 'slow'
   logPreset?: 'http-errors' | 'manager-requests'
 }
 

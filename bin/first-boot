@@ -9,3 +9,5 @@ if [[ ! -e "$runtime_root/config/endpoints.json" ]]; then
   umask 077
   printf '%s\n' '{"mode":"autodl","sshPort":22,"localPort":16008}' > "$runtime_root/config/endpoints.json"
 fi
+
+/root/xiaozhi-autodl/bin/prepare-native-logs

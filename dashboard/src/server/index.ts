@@ -40,6 +40,7 @@ import {
 
 const app = Fastify({
   logger: { level: process.env.LOG_LEVEL || 'info' },
+  disableRequestLogging: true,
   bodyLimit: 1024 * 1024,
   trustProxy: true,
 })
@@ -220,7 +221,7 @@ function logOptions(query: { lines?: string; level?: string; keyword?: string; s
   const requested = Number(query.lines || 200)
   const lines = requested >= 1000 ? 1000 : requested >= 500 ? 500 : 200
   const level: LogLevel = ['info', 'warn', 'error'].includes(query.level || '') ? query.level as LogLevel : 'all'
-  const source: LogSource | undefined = ['service', 'access', 'error'].includes(query.source || '') ? query.source as LogSource : undefined
+  const source: LogSource | undefined = ['service', 'access', 'error', 'raw', 'slow'].includes(query.source || '') ? query.source as LogSource : undefined
   const preset: LogPreset | undefined = ['http-errors', 'manager-requests'].includes(query.preset || '') ? query.preset as LogPreset : undefined
   return { lines, level, source, preset, keyword: (query.keyword || '').slice(0, 80) }
 }

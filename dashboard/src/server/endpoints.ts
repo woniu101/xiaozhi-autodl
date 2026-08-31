@@ -1,3 +1,4 @@
+import net from 'node:net'
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { MANAGER_WEB_PUBLIC_URL, RUNTIME_ROOT } from './config.js'
@@ -100,11 +101,25 @@ async function configuredValues(): Promise<{ ota?: string; websocket?: string }>
 
 async function routeReachable(path: string): Promise<boolean> {
   try {
-    const response = await fetch(`http://127.0.0.1:6008${path}`, { signal: AbortSignal.timeout(1_500) })
+    const response = await fetch(`http://127.0.0.1:6008${path}`, {
+      headers: { 'x-xiaozhi-health-probe': '1' },
+      signal: AbortSignal.timeout(1_500),
+    })
     return response.status < 500
   } catch {
     return false
   }
+}
+
+function portReachable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port })
+    const finish = (value: boolean) => { socket.destroy(); resolve(value) }
+    socket.setTimeout(1_500)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+  })
 }
 
 export async function endpointState() {
@@ -115,7 +130,7 @@ export async function endpointState() {
     configuredValues(),
     routeReachable('/'),
     routeReachable('/xiaozhi/ota/'),
-    routeReachable('/xiaozhi/v1/'),
+    portReachable(8000),
   ])
   const inSync = Boolean(urls.otaUrl && urls.websocketUrl && configured.ota === urls.otaUrl && configured.websocket === urls.websocketUrl)
   const tunnelCommand = config.mode === 'lan' && config.sshHost

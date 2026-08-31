@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- AutoDL 由 Supervisor 统一持久化和轮转，避免 Logback 再写一份系统盘文件。 -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml" />
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSSXXX} [%thread] %-5level %logger{50} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+    </root>
+    <logger name="xiaozhi" level="INFO" />
+    <logger name="org.springframework.web" level="WARN" />
+    <logger name="org.springboot.sample" level="WARN" />
+</configuration>

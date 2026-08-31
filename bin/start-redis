@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log=/root/autodl-tmp/xiaozhi-autodl/logs/redis/redis-server.log
+if [[ "$(/usr/bin/redis-cli --raw PING 2>/dev/null || true)" == PONG ]]; then
+  exit 0
+fi
+if [[ ! -e "$log" ]]; then
+  install -o redis -g adm -m 0660 /dev/null "$log"
+else
+  chown redis:adm "$log"
+  chmod 0660 "$log"
+fi
+exec /usr/sbin/runuser -u redis -- /usr/bin/redis-server /etc/redis/redis.conf --daemonize yes --logfile "$log"

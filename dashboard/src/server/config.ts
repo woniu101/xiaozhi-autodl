@@ -26,11 +26,11 @@ export const SERVICES: Record<ServiceName, {
   },
   mysql: {
     label: 'MySQL', port: 3306, supervisor: false,
-    log: '/var/log/mysql/error.log',
+    log: resolve(RUNTIME_ROOT, 'logs/mysql/error.log'),
   },
   redis: {
     label: 'Redis', port: 6379, supervisor: false,
-    log: '/var/log/redis/redis-server.log',
+    log: resolve(RUNTIME_ROOT, 'logs/redis/redis-server.log'),
   },
   'manager-api': {
     label: 'Manager API', port: 8002, supervisor: true,
