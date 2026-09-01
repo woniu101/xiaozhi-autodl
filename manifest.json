@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "product": "xiaozhi-autodl",
+  "repositories": [
+    { "name": "xiaozhi-autodl", "path": "/root/xiaozhi-autodl", "branch": "main" },
+    { "name": "xiaozhi-esp32-server", "path": "/root/xiaozhi-esp32-server", "branch": "mvp" },
+    { "name": "index-tts", "path": "/root/index-tts", "branch": "main" }
+  ],
+  "condaEnvironments": [
+    "/root/miniconda3/envs/xiaozhi-esp32-server",
+    "/root/miniconda3/envs/indextts25"
+  ],
+  "artifacts": [
+    "/root/xiaozhi-autodl/dashboard/dist/server/index.js",
+    "/root/xiaozhi-autodl/dashboard/dist/public/index.html",
+    "/root/xiaozhi-autodl/artifacts/manager-web/index.html",
+    "/root/xiaozhi-autodl/artifacts/manager-api/xiaozhi-esp32-api.jar"
+  ],
+  "modelFiles": [
+    {
+      "path": "/root/index-tts/checkpoints/config.yaml",
+      "bytes": 2860,
+      "sha256": "18adf417be3e8f5e2e48e30f7420c719170a6870619436250f360d626877870e"
+    },
+    {
+      "path": "/root/index-tts/checkpoints/gpt.pth",
+      "bytes": 3259599833,
+      "sha256": "43a8f4c30eccdf201958d3b9713511482c19d56dc20b0b1c4ee1e6b080b19d85"
+    },
+    {
+      "path": "/root/index-tts/checkpoints/codec.pth",
+      "bytes": 607290935,
+      "sha256": "d15cbed16a40f478438c961fb043f68dfa6353bf56c966761315db3433e9722c"
+    },
+    {
+      "path": "/root/index-tts/checkpoints/s2mel.pth",
+      "bytes": 414908601,
+      "sha256": "9b1b0003fc189c94cc349758d7ebc25f903b7eb2de4602879959cc64ce816456"
+    },
+    {
+      "path": "/root/index-tts/checkpoints/qwen0.6bemo4-merge/model.safetensors",
+      "bytes": 1192135096,
+      "sha256": "11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641"
+    },
+    {
+      "path": "/root/index-tts/checkpoints/qwen0.6bemo4-merge/config.json",
+      "bytes": 727,
+      "sha256": "2e04bc223dfb548dde52faebe2a819964523ff749cbe26467c49380aa371594f"
+    }
+  ],
+  "seeds": {
+    "characterStyles": "/opt/xiaozhi-esp32-server/data/character_styles",
+    "indexTtsVoices": "/root/index-tts/voices/voices.json"
+  },
+  "runtimeRoot": "/root/autodl-tmp/xiaozhi-autodl"
+}

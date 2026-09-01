@@ -25,6 +25,7 @@ export OMP_PLACES=cores
 export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH=/root/xiaozhi-autodl:/root/index-tts
 export PYTHONUNBUFFERED=1
+export TMPDIR=/root/autodl-tmp/xiaozhi-autodl/outputs/index-tts
 
 echo "IndexTTS CPU threads: $threads"
 cd /root/index-tts

@@ -14,6 +14,9 @@ export OMP_DYNAMIC=FALSE
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export XIAOZHI_CONSOLE_LOG_ONLY=true
+export CHARACTER_STYLE_DIR="${CHARACTER_STYLE_DIR:-/root/autodl-tmp/xiaozhi-autodl/character_styles}"
+export XIAOZHI_OUTPUT_DIR="${XIAOZHI_OUTPUT_DIR:-/root/autodl-tmp/xiaozhi-autodl/outputs/xiaozhi-server}"
+export TMPDIR="$XIAOZHI_OUTPUT_DIR"
 
 manager_ready=false
 for _ in $(seq 1 120); do
@@ -24,5 +27,9 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 [[ "$manager_ready" == true ]] || { echo 'Manager API 在 120 秒内未就绪，小智服务端取消启动' >&2; exit 1; }
+
+runtime_config=$(/root/xiaozhi-autodl/bin/prepare-xiaozhi-config)
+export XIAOZHI_CONFIG_PATH="$runtime_config"
+
 cd /root/xiaozhi-esp32-server/main/xiaozhi-server
 exec "$python_bin" -u app.py

@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=/root/xiaozhi-autodl
+source "$root/scripts/lib/image-common.sh"
+
+mode=runtime
+quick=false
+report=
+
+usage() {
+  cat <<'EOF'
+用法：validate-release [--mode runtime|pre-image|sealed] [--quick] [--report FILE]
+
+runtime   检查当前实例能否启动，资源不足只告警。
+pre-image 在 runtime 基础上要求三个仓库工作区干净。
+sealed    验证已执行脱敏，适合 prepare-image 的最终检查。
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --mode) mode=${2:-}; shift 2 ;;
+    --quick) quick=true; shift ;;
+    --report) report=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) image_die "未知参数：$1" ;;
+  esac
+done
+[[ "$mode" =~ ^(runtime|pre-image|sealed)$ ]] || image_die "无效模式：$mode"
+
+if [[ -n "$report" ]]; then
+  install -d -m 0755 "$(dirname "$report")"
+  : > "$report"
+  chmod 0600 "$report"
+fi
+
+errors=0
+warnings=0
+passes=0
+
+emit() {
+  printf '%s\n' "$*"
+  [[ -z "$report" ]] || printf '%s\n' "$*" >> "$report"
+}
+
+pass() {
+  passes=$((passes + 1))
+  emit "[PASS] $*"
+}
+
+warn() {
+  warnings=$((warnings + 1))
+  emit "[WARN] $*"
+}
+
+fail() {
+  errors=$((errors + 1))
+  emit "[FAIL] $*"
+}
+
+check_command() {
+  local command=$1
+  command -v "$command" >/dev/null 2>&1 && pass "命令存在：$command" || fail "缺少命令：$command"
+}
+
+check_file() {
+  local file=$1
+  [[ -s "$file" ]] && pass "文件存在：$file" || fail "文件缺失或为空：$file"
+}
+
+emit "小智 AutoDL 发布检查 mode=$mode quick=$quick"
+emit "开始时间：$(date --iso-8601=seconds)"
+
+for command in git node java nginx mysql mysqladmin redis-cli supervisorctl python3 sha256sum findmnt tar gzip flock logrotate cron; do
+  check_command "$command"
+done
+
+mount_target=$(findmnt -n -o TARGET -T "$XIAOZHI_DATA_MOUNT" 2>/dev/null || true)
+[[ "$mount_target" == "$XIAOZHI_DATA_MOUNT" ]] && pass 'autodl-tmp 是独立数据盘' || fail 'autodl-tmp 不是独立数据盘'
+
+while IFS=$'\t' read -r name path branch; do
+  if [[ ! -d "$path/.git" ]]; then
+    fail "仓库不存在：$path"
+    continue
+  fi
+  actual_branch=$(git -C "$path" branch --show-current)
+  [[ "$actual_branch" == "$branch" ]] && pass "$name 分支为 $branch" || fail "$name 分支应为 $branch，实际为 $actual_branch"
+  dirty=$(git -C "$path" status --porcelain --untracked-files=normal)
+  if [[ -n "$dirty" ]]; then
+    if [[ "$mode" == runtime ]]; then
+      warn "$name 工作区存在未提交改动"
+    else
+      fail "$name 工作区不是干净状态"
+    fi
+  else
+    pass "$name 工作区干净"
+  fi
+done <<'EOF'
+xiaozhi-autodl	/root/xiaozhi-autodl	main
+xiaozhi-esp32-server	/root/xiaozhi-esp32-server	mvp
+index-tts	/root/index-tts	main
+EOF
+
+while IFS= read -r environment; do
+  [[ -x "$environment/bin/python" ]] && pass "Conda 环境存在：$environment" || fail "Conda 环境缺失：$environment"
+done < <(/usr/bin/python3 -c 'import json; print("\n".join(json.load(open("/root/xiaozhi-autodl/manifest.json"))["condaEnvironments"]))')
+
+while IFS= read -r artifact; do
+  check_file "$artifact"
+done < <(/usr/bin/python3 -c 'import json; print("\n".join(json.load(open("/root/xiaozhi-autodl/manifest.json"))["artifacts"]))')
+
+while IFS=$'\t' read -r path bytes digest; do
+  if [[ ! -s "$path" ]]; then
+    fail "模型文件缺失：$path"
+    continue
+  fi
+  actual_bytes=$(stat -c %s "$path")
+  if [[ "$actual_bytes" == "$bytes" ]]; then
+    pass "模型大小正确：$path"
+  else
+    fail "模型大小错误：$path（期望 $bytes，实际 $actual_bytes）"
+    continue
+  fi
+  if [[ "$quick" == false ]]; then
+    actual_digest=$(sha256sum "$path" | awk '{print $1}')
+    [[ "$actual_digest" == "$digest" ]] && pass "模型校验通过：$path" || fail "模型校验失败：$path"
+  fi
+done < <(/usr/bin/python3 - <<'PY'
+import json
+for item in json.load(open('/root/xiaozhi-autodl/manifest.json'))['modelFiles']:
+    print(item['path'], item['bytes'], item['sha256'], sep='\t')
+PY
+)
+
+check_file /root/index-tts/voices/voices.json
+if directory_has_payload /opt/xiaozhi-esp32-server/data/character_styles; then
+  pass '人物资源 seed 存在'
+else
+  fail '人物资源 seed 不存在'
+fi
+
+cpu_quota=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf 'unknown')
+memory_max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || printf 'unknown')
+emit "[INFO] Cgroup CPU：$cpu_quota"
+emit "[INFO] Cgroup 内存：$memory_max"
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q '^GPU '; then
+  pass '检测到 NVIDIA GPU'
+else
+  warn '未检测到 NVIDIA GPU；Dashboard 可运行，IndexTTS 完整验收需 GPU 实例'
+fi
+
+system_free=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+data_free=$(df -B1 --output=avail "$XIAOZHI_DATA_MOUNT" | tail -1 | tr -d ' ')
+((system_free >= 2 * 1024 * 1024 * 1024)) && pass '系统盘剩余空间不少于 2 GiB' || warn '系统盘剩余空间低于 2 GiB'
+((data_free >= 5 * 1024 * 1024 * 1024)) && pass '数据盘剩余空间不少于 5 GiB' || fail '数据盘剩余空间低于 5 GiB'
+
+if [[ "$mode" == sealed ]]; then
+  for sensitive in \
+    /root/xiaozhi-esp32-server/main/xiaozhi-server/data/.config.yaml \
+    /root/.codex \
+    /root/.git-credentials \
+    /root/.config/gh \
+    /root/.npmrc \
+    /root/.bash_history \
+    /root/.mysql_history; do
+    [[ ! -e "$sensitive" ]] && pass "实例凭据已移除：$sensitive" || fail "镜像中仍有实例凭据：$sensitive"
+  done
+  private_ssh=$(find /root/.ssh -maxdepth 1 -type f \( -name 'id_*' ! -name '*.pub' -o -name 'known_hosts*' -o -name config \) -print -quit 2>/dev/null || true)
+  [[ -z "$private_ssh" ]] && pass 'SSH 私钥和主机记录已移除' || fail "SSH 私密文件仍存在：$private_ssh"
+
+  if mysql_ready; then
+    sensitive_params=$(/usr/bin/mysql --defaults-file=/etc/mysql/debian.cnf --batch --skip-column-names "$XIAOZHI_DB" -e "SELECT COUNT(*) FROM sys_params WHERE param_code IN ('server.secret','server.private_key','server.public_key','server.ota','server.websocket','server.mqtt_signature_key','aliyun.sms.access_key_id','aliyun.sms.access_key_secret') AND COALESCE(param_value,'') <> ''")
+    [[ "$sensitive_params" == 0 ]] && pass '实例参数已脱敏' || fail "仍有 $sensitive_params 个实例参数未清理"
+    model_secrets=$(/usr/bin/mysql --defaults-file=/etc/mysql/debian.cnf --batch --skip-column-names "$XIAOZHI_DB" -e "SELECT COUNT(*) FROM ai_model_config WHERE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.api_key')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.token')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.secret')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.password')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.access_key_id')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.access_key_secret')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.access_token')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.api_password')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.api_secret')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.appkey')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.authorization')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.embedding_api_key')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.llm_api_key')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.personal_access_token')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.secret_id')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.secret_key')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.http_proxy')),'') <> '' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(config_json,'$.https_proxy')),'') <> '' OR COALESCE(JSON_LENGTH(JSON_EXTRACT(config_json,'$.headers')),0) > 0")
+    [[ "$model_secrets" == 0 ]] && pass '模型供应商密钥已清空' || fail "仍有 $model_secrets 个模型配置包含密钥"
+    private_rows=$(/usr/bin/mysql --defaults-file=/etc/mysql/debian.cnf --batch --skip-column-names "$XIAOZHI_DB" -e "SELECT (SELECT COUNT(*) FROM sys_user_token) + (SELECT COUNT(*) FROM ai_device) + (SELECT COUNT(*) FROM ai_agent_chat_history) + (SELECT COUNT(*) FROM ai_agent_chat_audio)")
+    [[ "$private_rows" == 0 ]] && pass 'Token、设备和聊天数据已清空' || fail "仍有 $private_rows 条实例私有记录"
+    preset_rows=$(/usr/bin/mysql --defaults-file=/etc/mysql/debian.cnf --batch --skip-column-names "$XIAOZHI_DB" -e "SELECT (SELECT COUNT(*) FROM sys_user WHERE username='xiaozhi') + (SELECT COUNT(*) FROM ai_agent WHERE agent_name='兔娘')")
+    [[ "$preset_rows" -ge 2 ]] && pass '智控台账号和兔娘智能体预置仍存在' || fail '智控台账号或兔娘智能体预置缺失'
+    unexpected_presets=$(/usr/bin/mysql --defaults-file=/etc/mysql/debian.cnf --batch --skip-column-names "$XIAOZHI_DB" -e "SELECT (SELECT COUNT(*) FROM sys_user WHERE username<>'xiaozhi') + (SELECT COUNT(*) FROM ai_agent WHERE agent_name<>'兔娘')")
+    [[ "$unexpected_presets" == 0 ]] && pass '没有额外账号或非发布智能体' || fail "发现 $unexpected_presets 个额外账号或非发布智能体，需人工确认后再封镜"
+  else
+    fail 'sealed 检查需要 MySQL 保持运行'
+  fi
+fi
+
+emit "完成：PASS=$passes WARN=$warnings FAIL=$errors"
+if ((errors)); then
+  exit 1
+fi

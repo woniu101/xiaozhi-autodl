@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=/root/xiaozhi-autodl
+source "$root/scripts/lib/image-common.sh"
+
+apply=false
+requested_backup=
+
+usage() {
+  cat <<'EOF'
+用法：resume-development [--dry-run|--apply] [BACKUP_DIR]
+
+默认使用 /root/autodl-tmp/xiaozhi-autodl/dev-state/latest。
+默认及 --dry-run 只检查备份；--apply 会恢复数据库、运行配置和开发身份并重新启动服务。
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --dry-run) apply=false; shift ;;
+    --apply) apply=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) image_die "未知参数：$1" ;;
+    *) [[ -z "$requested_backup" ]] || image_die '只能指定一个备份目录'; requested_backup=$1; shift ;;
+  esac
+done
+
+require_root
+require_data_mount
+backup=${requested_backup:-$XIAOZHI_AUTODL_RUNTIME/dev-state/latest}
+backup=$(readlink -f "$backup" 2>/dev/null || true)
+dev_root=$(readlink -f "$XIAOZHI_AUTODL_RUNTIME/dev-state")
+[[ -n "$backup" && -d "$backup" ]] || image_die '找不到开发状态备份'
+[[ "$backup" == "$dev_root"/* ]] || image_die '备份目录必须位于 autodl-tmp/xiaozhi-autodl/dev-state 内'
+[[ -s "$backup/mysql.sql.gz" && -s "$backup/SHA256SUMS" ]] || image_die '备份不完整：缺少数据库或校验文件'
+
+(
+  cd "$backup"
+  sha256sum --check SHA256SUMS
+)
+
+if [[ "$apply" == false ]]; then
+  image_log "DRY RUN：备份有效，不会覆盖当前数据：$backup"
+  image_log '执行恢复：scripts/resume-development --apply'
+  exit 0
+fi
+
+if pgrep -fa '/usr/bin/codex|codex.*app-server|codex-code-mode-host' >/dev/null 2>&1; then
+  image_die '检测到 Codex 正在运行。请结束 Codex 后在普通 SSH 终端恢复，避免覆盖活动中的配置数据库'
+fi
+
+install_runtime_directories
+exec 9>"$XIAOZHI_AUTODL_RUNTIME/run/prepare-image.lock"
+flock -n 9 || image_die '已有 prepare-image 或 resume-development 正在运行'
+
+stop_supervisor_services
+if [[ "$(redis-cli --raw PING 2>/dev/null || true)" == PONG ]]; then
+  redis-cli SHUTDOWN SAVE >/dev/null || true
+fi
+ensure_mysql_running
+
+image_log '恢复 MySQL 业务数据库'
+gzip -dc "$backup/mysql.sql.gz" | mysql --defaults-file=/etc/mysql/debian.cnf
+
+if [[ -s "$backup/runtime-state.tar.gz" ]]; then
+  tar -C "$XIAOZHI_AUTODL_RUNTIME" -xzf "$backup/runtime-state.tar.gz"
+fi
+if [[ -s "$backup/system-state.tar.gz" ]]; then
+  tar -C / -xzf "$backup/system-state.tar.gz"
+fi
+if [[ -s "$backup/developer-profile.tar.gz" ]]; then
+  tar -C / -xzf "$backup/developer-profile.tar.gz"
+fi
+
+rm -f /root/.xiaozhi-image-prepared /root/xiaozhi-image-manifest.json
+"$root/bin/first-boot"
+"$root/bin/suite-start"
+image_log "开发状态已恢复：$backup"

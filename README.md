@@ -1,6 +1,29 @@
 # 小智 AutoDL 运维中心
 
-当前阶段目标是在现有 AutoDL 实例上完成基础运行与运维，不涉及镜像制作。
+当前项目同时覆盖日常运行、版本维护和 AutoDL 镜像制作。镜像采用“系统盘种子 + 数据盘实例数据”结构：代码、模型和预置内容进入镜像，口令、音色副本、人物资源、输出与日志保存在 `/root/autodl-tmp`。
+
+## 镜像工作流
+
+首次启动与镜像准备统一使用仓库内脚本：
+
+```bash
+# 日常/新实例首次初始化
+/root/xiaozhi-autodl/bin/first-boot
+
+# 发布检查：运行态、封镜前、封镜后
+/root/xiaozhi-autodl/scripts/validate-release --mode runtime --quick
+/root/xiaozhi-autodl/scripts/validate-release --mode pre-image
+
+# 先预演，再在普通 SSH 终端中执行封镜准备
+/root/xiaozhi-autodl/scripts/prepare-image --dry-run
+/root/xiaozhi-autodl/scripts/prepare-image --apply
+
+# AutoDL 保存完镜像后，恢复当前实例的开发状态
+/root/xiaozhi-autodl/scripts/resume-development --dry-run
+/root/xiaozhi-autodl/scripts/resume-development --apply
+```
+
+`prepare-image --apply` 会先将数据库、运行配置和开发身份备份到数据盘，再定向清除系统盘中的实例凭据。它不会删除智控台 `xiaozhi` 内置账号、兔娘智能体、兔娘音色、模型配置骨架或模型文件。详细边界、目录和恢复步骤见 [`docs/image-workflow.md`](docs/image-workflow.md)。
 
 ## 日常更新与构建
 

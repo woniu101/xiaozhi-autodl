@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+set -a
+source /root/xiaozhi-autodl/config/defaults.env
+set +a
+
+server_secret=$(
+  MYSQL_PWD="${XIAOZHI_MYSQL_PASSWORD:-123456}" /usr/bin/mysql \
+    --batch --skip-column-names -h 127.0.0.1 -u "${XIAOZHI_MYSQL_USER:-root}" \
+    -e "SELECT param_value FROM xiaozhi_esp32_server.sys_params WHERE param_code='server.secret' LIMIT 1" 2>/dev/null || true
+)
+[[ -n "$server_secret" && "$server_secret" != null ]] || { echo 'Manager API 尚未生成实例密钥' >&2; exit 1; }
+
+runtime_config=/root/autodl-tmp/xiaozhi-autodl/config/xiaozhi-server.yaml
+temporary_config="${runtime_config}.$$"
+install -d -m 0755 "$(dirname "$runtime_config")"
+umask 077
+printf '%s\n' \
+  'server:' \
+  '  ip: 0.0.0.0' \
+  '  port: 8000' \
+  '  http_port: 8003' \
+  '  vision_explain: ""' \
+  'manager-api:' \
+  '  url: http://127.0.0.1:8002/xiaozhi' \
+  "  secret: \"$server_secret\"" \
+  'character_style_data_dir: /root/autodl-tmp/xiaozhi-autodl' \
+  'prompt_template: agent-base-prompt.txt' > "$temporary_config"
+mv -f "$temporary_config" "$runtime_config"
+printf '%s\n' "$runtime_config"

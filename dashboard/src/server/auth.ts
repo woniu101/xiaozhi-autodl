@@ -39,13 +39,13 @@ export async function initializeAuth(): Promise<{ credentialPath: string; initia
   try {
     const loaded = JSON.parse(await readFile(secretPath, 'utf8')) as SecretFile & { initialPassword?: string }
     secrets = {
-      version: loaded.version || 1,
+      version: 2,
       salt: loaded.salt,
       passwordHash: loaded.passwordHash,
       sessionSecret: loaded.sessionSecret || randomBytes(32).toString('hex'),
     }
-    // 兼容旧版口令，下一次修改后会写入无明文字段的 v2 文件。
-    if (!loaded.sessionSecret) await persist(secrets)
+    // 读取旧版文件后立即迁移，保留哈希口令并删除历史明文字段。
+    if (loaded.version !== 2 || loaded.initialPassword || !loaded.sessionSecret) await persist(secrets)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     await persist({ version: 2, sessionSecret: randomBytes(32).toString('hex') })

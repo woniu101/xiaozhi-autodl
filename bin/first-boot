@@ -1,13 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime_root=/root/autodl-tmp/xiaozhi-autodl
-install -d -m 0755 "$runtime_root" "$runtime_root/config" "$runtime_root/logs" "$runtime_root/run" "$runtime_root/uploads" "$runtime_root/voices"
-install -d -m 0700 "$runtime_root/secrets"
+root=/root/xiaozhi-autodl
+source "$root/scripts/lib/image-common.sh"
+
+require_root
+require_data_mount
+install_runtime_directories
+seed_runtime_data
+
+runtime_root=$XIAOZHI_AUTODL_RUNTIME
 
 if [[ ! -e "$runtime_root/config/endpoints.json" ]]; then
   umask 077
   printf '%s\n' '{"mode":"autodl","sshPort":22,"localPort":16008}' > "$runtime_root/config/endpoints.json"
 fi
 
-/root/xiaozhi-autodl/bin/prepare-native-logs
+install -o root -g root -m 0755 "$root/config/autodl.sh" /root/autodl.sh
+if [[ ! -e /etc/autodl.sh || -L /etc/autodl.sh ]]; then
+  ln -sfn /root/autodl.sh /etc/autodl.sh
+else
+  image_die '/etc/autodl.sh 已存在且不是符号链接，请人工确认'
+fi
+
+"$root/bin/prepare-native-logs"
+
+report="$runtime_root/state/first-boot-report.txt"
+if ! "$root/scripts/validate-release" --mode runtime --quick --report "$report"; then
+  image_die "首次启动预检失败，详情见 $report"
+fi
+
+if [[ ! -e "$runtime_root/state/initialized" ]]; then
+  printf 'initialized_at=%s\n' "$(date --iso-8601=seconds)" > "$runtime_root/state/initialized"
+  chmod 0600 "$runtime_root/state/initialized"
+fi

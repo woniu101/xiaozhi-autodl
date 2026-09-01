@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=/root/xiaozhi-autodl
+source "$root/scripts/lib/image-common.sh"
+
+apply=false
+
+usage() {
+  cat <<'EOF'
+用法：prepare-image [--dry-run|--apply]
+
+默认及 --dry-run：只显示检查结果和计划，不修改系统。
+--apply：停止服务、备份开发状态到 autodl-tmp、清理实例凭据并执行 sealed 验收。
+
+必须在普通 SSH 终端中执行 --apply；检测到 Codex 正在运行时会拒绝封镜，防止破坏当前会话。
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --dry-run) apply=false; shift ;;
+    --apply) apply=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) image_die "未知参数：$1" ;;
+  esac
+done
+
+require_root
+require_data_mount
+install_runtime_directories
+
+if [[ "$apply" == false ]]; then
+  image_log 'DRY RUN：不会停止服务、备份或删除任何文件'
+  "$root/scripts/validate-release" --mode runtime --quick || true
+  image_log '执行 --apply 时将进行以下操作：'
+  image_log '1. 要求三个仓库已提交且模型完整'
+  image_log '2. 停止业务服务，在 autodl-tmp/dev-state 创建数据库、运行配置和开发身份备份'
+  image_log '3. 保留智控台 xiaozhi 账号、兔娘智能体、兔娘音色与模型参数'
+  image_log '4. 清除 DeepSeek 等供应商密钥、登录 Token、设备、聊天、旧公网地址和实例密钥'
+  image_log '5. 清除系统盘 Codex/GitHub/Git/SSH 私密身份与历史记录'
+  image_log '6. 生成镜像版本清单并执行 sealed 验收'
+  image_log '恢复开发时执行：scripts/resume-development --apply'
+  exit 0
+fi
+
+if pgrep -fa '/usr/bin/codex|codex.*app-server|codex-code-mode-host' >/dev/null 2>&1; then
+  image_die '检测到 Codex 正在运行。请结束 Codex 后在普通 SSH 终端重新执行 --apply'
+fi
+
+"$root/scripts/validate-release" --mode pre-image
+
+exec 9>"$XIAOZHI_AUTODL_RUNTIME/run/prepare-image.lock"
+flock -n 9 || image_die '已有 prepare-image 或 resume-development 正在运行'
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup="$XIAOZHI_AUTODL_RUNTIME/dev-state/$timestamp"
+install -d -m 0700 "$backup"
+image_log "开发状态备份目录：$backup"
+
+stop_supervisor_services
+if [[ "$(redis-cli --raw PING 2>/dev/null || true)" == PONG ]]; then
+  redis-cli SAVE >/dev/null || true
+fi
+ensure_mysql_running
+
+write_repo_versions "$backup/repositories.json"
+for repository in /root/xiaozhi-autodl /root/xiaozhi-esp32-server /root/index-tts; do
+  name=$(basename "$repository")
+  git -C "$repository" status --short --branch > "$backup/${name}-status.txt"
+done
+
+image_log '备份 MySQL 业务数据库'
+mysqldump --defaults-file=/etc/mysql/debian.cnf \
+  --single-transaction --routines --events --triggers --hex-blob \
+  --add-drop-database --databases "$XIAOZHI_DB" | gzip -1 > "$backup/mysql.sql.gz"
+chmod 0600 "$backup/mysql.sql.gz"
+
+runtime_items=()
+for item in config secrets character_styles index-tts voices; do
+  [[ -e "$XIAOZHI_AUTODL_RUNTIME/$item" ]] && runtime_items+=("$item")
+done
+if ((${#runtime_items[@]})); then
+  tar -C "$XIAOZHI_AUTODL_RUNTIME" -czf "$backup/runtime-state.tar.gz" "${runtime_items[@]}"
+  chmod 0600 "$backup/runtime-state.tar.gz"
+fi
+
+system_items=()
+for item in \
+  root/autodl.sh \
+  root/xiaozhi-esp32-server/main/xiaozhi-server/data/.config.yaml \
+  root/index-tts/outputs \
+  var/lib/redis/dump.rdb; do
+  [[ -e "/$item" ]] && system_items+=("$item")
+done
+if ((${#system_items[@]})); then
+  tar -C / -czf "$backup/system-state.tar.gz" "${system_items[@]}"
+  chmod 0600 "$backup/system-state.tar.gz"
+fi
+
+developer_items=()
+for item in root/.codex root/.gitconfig root/.git-credentials root/.config/gh root/.npmrc root/.ssh root/.bash_history root/.mysql_history root/.python_history; do
+  [[ -e "/$item" ]] && developer_items+=("$item")
+done
+if ((${#developer_items[@]})); then
+  image_log '备份开发身份（仅保存在当前实例数据盘）'
+  tar -C / -czf "$backup/developer-profile.tar.gz" \
+    --exclude='root/.codex/app-server-control' \
+    --exclude='root/.codex/tmp' \
+    --exclude='root/.codex/.tmp' \
+    --exclude='root/.codex/cache' \
+    --exclude='root/.codex/log' \
+    --exclude='root/.codex/plugins/cache' \
+    "${developer_items[@]}"
+  chmod 0600 "$backup/developer-profile.tar.gz"
+fi
+
+(
+  cd "$backup"
+  sha256sum ./*.gz repositories.json > SHA256SUMS
+  chmod 0600 SHA256SUMS
+)
+ln -sfn "$timestamp" "$XIAOZHI_AUTODL_RUNTIME/dev-state/latest"
+
+image_log '清理数据库中的实例数据和外部服务密钥'
+mysql --defaults-file=/etc/mysql/debian.cnf "$XIAOZHI_DB" < "$root/config/image-sanitize.sql"
+if [[ "$(redis-cli --raw PING 2>/dev/null || true)" == PONG ]]; then
+  redis-cli FLUSHALL >/dev/null
+  redis-cli SAVE >/dev/null
+  redis-cli SHUTDOWN SAVE >/dev/null || true
+fi
+
+rm -f /root/xiaozhi-esp32-server/main/xiaozhi-server/data/.config.yaml
+if [[ -d /root/index-tts/outputs ]]; then
+  find /root/index-tts/outputs -mindepth 1 -maxdepth 1 -delete
+fi
+for repository in /root/xiaozhi-autodl /root/xiaozhi-esp32-server /root/index-tts; do
+  find "$repository" -maxdepth 1 -type f -name '.attach_pid*' -size 0 -delete
+done
+
+rm -rf /root/.codex /root/.config/gh
+rm -f /root/.gitconfig /root/.git-credentials /root/.npmrc \
+  /root/.bash_history /root/.mysql_history /root/.python_history
+if [[ -d /root/.ssh ]]; then
+  find /root/.ssh -maxdepth 1 -type f \( -name 'id_*' ! -name '*.pub' -o -name 'known_hosts*' -o -name config \) -delete
+fi
+
+write_repo_versions /root/xiaozhi-image-manifest.json
+printf 'prepared_at=%s\nbackup=%s\n' "$(date --iso-8601=seconds)" "$backup" > /root/.xiaozhi-image-prepared
+chmod 0600 /root/.xiaozhi-image-prepared
+
+if ! "$root/scripts/validate-release" --mode sealed --quick --report "$backup/sealed-validation.txt"; then
+  image_die "sealed 验收失败。开发备份已保留在 $backup，请先执行 resume-development --apply"
+fi
+
+timeout 30 /usr/sbin/service mysql stop >/dev/null || true
+image_log '镜像准备完成；MySQL 和业务服务均已停止'
+image_log "保存 AutoDL 镜像后，可在本实例执行：$root/scripts/resume-development --apply $backup"
