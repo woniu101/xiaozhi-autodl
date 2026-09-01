@@ -126,7 +126,7 @@ label { color: #556381; font-size: 13px; font-weight: 600; }
 .overall-status.ready { color: #23845b; border-color: #d6efe3; background: #e9f8f1; }.overall-status.ready i { background: var(--success); box-shadow: 0 0 0 4px rgba(40, 183, 120, .12); }
 .overall-status.starting { color: #356dc9; border-color: #d9e5ff; background: #edf4ff; }.overall-status.starting i { background: #4d80ed; animation: status-pulse 1.4s infinite; }
 .overall-status.stopping { color: #69778f; border-color: #dce3ee; background: #f3f5f8; }.overall-status.stopping i { background: #8c99ad; animation: status-pulse 1.4s infinite; }
-.overall-status.degraded { color: #a96e12; border-color: #f3dfb8; background: #fff5e3; }.overall-status.degraded i { background: var(--warning); }
+.overall-status.degraded, .overall-status.blocked { color: #a96e12; border-color: #f3dfb8; background: #fff5e3; }.overall-status.degraded i, .overall-status.blocked i { background: var(--warning); }
 .overall-status.stopped, .overall-status.unknown { color: #69778f; border-color: #e1e6ef; background: #f1f3f7; }.overall-status.stopped i, .overall-status.unknown i { background: #9ba6b8; }
 .overall-status.failed { color: #c64f5a; border-color: #f0c9cd; background: #fff0f1; }.overall-status.failed i { background: var(--danger); box-shadow: 0 0 0 4px rgba(242, 103, 112, .11); }
 @keyframes status-pulse { 50% { opacity: .35; transform: scale(.75); } }
@@ -188,11 +188,12 @@ label { color: #556381; font-size: 13px; font-weight: 600; }
 /* Service cards */
 .service-grid { margin-top: 14px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .service-card { min-width: 0; min-height: 238px; padding: 18px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); display: flex; flex-direction: column; }
-.service-card.failed { border-color: #f2c5ca; }.service-card.starting { border-color: #cfdfff; }.service-card.degraded { border-color: #f1d7a4; }.service-card.stopped { border-color: #e1e5ec; }
+.service-card.failed { border-color: #f2c5ca; }.service-card.starting { border-color: #cfdfff; }.service-card.degraded, .service-card.blocked { border-color: #f1d7a4; }.service-card.stopped { border-color: #e1e5ec; }
 .service-card { transition: opacity .2s, border-color .2s, box-shadow .2s, transform .2s; }
 .service-card.health-target { transform: translateY(-2px); }
 .service-card.health-target.failed { box-shadow: 0 0 0 3px rgba(242, 103, 112, .14), var(--shadow); }
 .service-card.health-target.degraded { box-shadow: 0 0 0 3px rgba(243, 167, 53, .15), var(--shadow); }
+.service-card.health-target.blocked { box-shadow: 0 0 0 3px rgba(243, 167, 53, .15), var(--shadow); }
 .service-card.health-target.starting { box-shadow: 0 0 0 3px rgba(71, 120, 255, .14), var(--shadow); }
 .service-card.health-target.stopped { box-shadow: 0 0 0 3px rgba(139, 151, 172, .13), var(--shadow); }
 .service-card.health-dimmed { opacity: .48; }
@@ -202,12 +203,13 @@ label { color: #556381; font-size: 13px; font-weight: 600; }
 .service-icon.mysql { background: linear-gradient(135deg, #5caad8, #357cae); }.service-icon.redis { background: linear-gradient(135deg, #f57878, #d84b57); }.service-icon.index-tts { background: linear-gradient(135deg, #9c73f4, #6a57d8); }.service-icon.xiaozhi-server { background: linear-gradient(135deg, #46c6ac, #278eb9); }
 .service-identity h3 { font-size: 16px; margin: 0 0 4px; color: #29395a; }.service-identity small { color: #8f9bb2; font-size: 12px; }
 .phase-badge { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; border-radius: 16px; padding: 6px 10px; font-size: 11px; font-weight: 600; background: #f1f3f7; color: #7a879e; }
-.phase-badge.ready { color: #23845b; background: #eaf8f1; }.phase-badge.ready i { background: var(--success); }.phase-badge.starting { color: #356dc9; background: #edf4ff; }.phase-badge.starting i { background: #4d80ed; animation: status-pulse 1.4s infinite; }.phase-badge.stopping { color: #69778f; background: #f1f3f7; }.phase-badge.stopping i { background: #8c99ad; animation: status-pulse 1.4s infinite; }.phase-badge.degraded { color: #ad7823; background: #fff5e3; }.phase-badge.degraded i { background: var(--warning); }.phase-badge.failed { color: #c95661; background: #fff0f1; }.phase-badge.failed i { background: var(--danger); }.phase-badge.stopped i { background: #9ba6b8; }
+.phase-badge.ready { color: #23845b; background: #eaf8f1; }.phase-badge.ready i { background: var(--success); }.phase-badge.starting { color: #356dc9; background: #edf4ff; }.phase-badge.starting i { background: #4d80ed; animation: status-pulse 1.4s infinite; }.phase-badge.stopping { color: #69778f; background: #f1f3f7; }.phase-badge.stopping i { background: #8c99ad; animation: status-pulse 1.4s infinite; }.phase-badge.degraded, .phase-badge.blocked { color: #ad7823; background: #fff5e3; }.phase-badge.degraded i, .phase-badge.blocked i { background: var(--warning); }.phase-badge.failed { color: #c95661; background: #fff0f1; }.phase-badge.failed i { background: var(--danger); }.phase-badge.stopped i { background: #9ba6b8; }
 .service-stats { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 15px; padding: 12px 0; background: #f7f9fd; border-radius: 11px; }
 .service-stats span { padding: 0 12px; border-left: 1px solid #e8edf6; min-width: 0; }.service-stats span:first-child { border: 0; }
 .service-stats small, .service-stats b { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.service-stats small { color: #929fb5; font-size: 11px; }.service-stats b { margin-top: 4px; color: #52617c; font-size: 13px; }.service-stats b.warning { color: #b87816; }.service-stats b.critical { color: #d6525e; }
 .service-note { margin-top: 12px; min-height: 38px; display: grid; grid-template-columns: 66px minmax(0, 1fr) auto; align-items: start; gap: 8px; }
 .service-note span { color: #8794ac; font-size: 11px; padding-top: 2px; }.service-note p { margin: 0; color: #61708b; font-size: 12px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.service-note.has-error p { color: #d05d67; }
+.service-note.has-blocker p { color: #a96e12; }
 .service-actions { display: grid; grid-template-columns: 1.35fr repeat(3, 1fr); gap: 8px; margin-top: auto; }.service-actions button { padding: 8px 6px; font-size: 12px; }
 
 /* Toasts, dialogs, logs */

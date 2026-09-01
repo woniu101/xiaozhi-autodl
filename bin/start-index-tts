@@ -3,6 +3,7 @@ set -euo pipefail
 set -a
 source /root/xiaozhi-autodl/config/defaults.env
 set +a
+/root/xiaozhi-autodl/bin/service-preflight index-tts --resources-only
 # 每次启动都按容器实际可用 CPU 自动计算，不继承父环境中的非法 OMP_NUM_THREADS。
 threads=$(nproc)
 if [[ -r /sys/fs/cgroup/cpu.max ]]; then

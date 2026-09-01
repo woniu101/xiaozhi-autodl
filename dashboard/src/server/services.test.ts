@@ -7,6 +7,7 @@ const expected: Record<ServicePhase, { start: boolean; stop: boolean; restart: b
   STARTING: { start: false, stop: true, restart: false },
   STOPPING: { start: false, stop: false, restart: false },
   DEGRADED: { start: false, stop: true, restart: true },
+  BLOCKED: { start: false, stop: false, restart: false },
   STOPPED: { start: true, stop: false, restart: false },
   FAILED: { start: true, stop: false, restart: false },
 }

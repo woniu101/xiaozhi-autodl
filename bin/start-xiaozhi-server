@@ -6,7 +6,17 @@ test -x "$python_bin" || { echo '小智 Conda 环境不存在' >&2; exit 1; }
 set -a
 source /root/xiaozhi-autodl/config/defaults.env
 set +a
-export OMP_NUM_THREADS="${XIAOZHI_CPU_THREADS:-4}"
+/root/xiaozhi-autodl/bin/service-preflight xiaozhi-server --resources-only
+threads="${XIAOZHI_CPU_THREADS:-4}"
+if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+  read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+  if [[ "$cpu_quota" != max ]] && [[ "$cpu_quota" =~ ^[0-9]+$ ]] && [[ "$cpu_period" =~ ^[0-9]+$ ]] && (( cpu_period > 0 )); then
+    quota_threads=$(( (cpu_quota + cpu_period - 1) / cpu_period ))
+    (( quota_threads < threads )) && threads=$quota_threads
+  fi
+fi
+(( threads < 1 )) && threads=1
+export OMP_NUM_THREADS="$threads"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"
 export NUMEXPR_NUM_THREADS="$OMP_NUM_THREADS"
@@ -18,6 +28,8 @@ export CHARACTER_STYLE_DIR="${CHARACTER_STYLE_DIR:-/root/autodl-tmp/xiaozhi-auto
 export XIAOZHI_OUTPUT_DIR="${XIAOZHI_OUTPUT_DIR:-/root/autodl-tmp/xiaozhi-autodl/outputs/xiaozhi-server}"
 export TMPDIR="$XIAOZHI_OUTPUT_DIR"
 
+echo "小智服务端 CPU threads: $threads"
+
 manager_ready=false
 for _ in $(seq 1 120); do
   if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:8002/xiaozhi/user/pub-config >/dev/null 2>&1; then
@@ -27,6 +39,22 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 [[ "$manager_ready" == true ]] || { echo 'Manager API 在 120 秒内未就绪，小智服务端取消启动' >&2; exit 1; }
+
+if ! /root/xiaozhi-autodl/bin/service-preflight index-tts --resources-only; then
+  echo 'IndexTTS 运行资源不足，小智服务端取消启动' >&2
+  exit 75
+fi
+
+index_ready=false
+dependency_wait_seconds="${XIAOZHI_DEPENDENCY_WAIT_SECONDS:-600}"
+for _ in $(seq 1 "$dependency_wait_seconds"); do
+  if curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:8092/health/ready >/dev/null 2>&1; then
+    index_ready=true
+    break
+  fi
+  sleep 1
+done
+[[ "$index_ready" == true ]] || { echo "IndexTTS 在 ${dependency_wait_seconds} 秒内未就绪，小智服务端取消启动" >&2; exit 75; }
 
 runtime_config=$(/root/xiaozhi-autodl/bin/prepare-xiaozhi-config)
 export XIAOZHI_CONFIG_PATH="$runtime_config"

@@ -5,7 +5,7 @@ import { RUNTIME_ROOT, SERVICES, SUPERVISOR_CONFIG, type ServiceAction, type Ser
 import { run } from './process.js'
 import { observeStability, serviceSignals } from './service-metrics.js'
 
-export type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
+export type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'BLOCKED' | 'STOPPED' | 'FAILED'
 export type LogLevel = 'all' | 'info' | 'warn' | 'error'
 export type LogSource = 'service' | 'access' | 'error' | 'raw' | 'slow'
 export type LogPreset = 'http-errors' | 'manager-requests'
@@ -16,9 +16,19 @@ export interface ServiceActions {
   restart: boolean
 }
 
+export interface ServicePreflight {
+  service: string
+  ok: boolean
+  kind?: 'resource' | 'dependency'
+  reason: string
+  checkedAt: string
+  checks: Array<{ key: string; label: string; ok: boolean; actual: unknown; required: unknown; unit?: string }>
+}
+
 export class ServiceOperationConflict extends Error {}
 
 const activeActions = new Map<ServiceName, ServiceAction>()
+const preflightCache = new Map<ServiceName, { expiresAt: number; result: ServicePreflight }>()
 
 const startOrder: ServiceName[] = ['mysql', 'redis', 'manager-api', 'index-tts', 'xiaozhi-server', 'web-gateway']
 const stopOrder = [...startOrder].reverse()
@@ -73,10 +83,25 @@ async function systemServiceRunning(name: 'mysql' | 'redis'): Promise<boolean> {
 }
 
 export function actionsForPhase(phase: ServicePhase, locked = false): ServiceActions {
-  if (locked || phase === 'STOPPING') return { start: false, stop: false, restart: false }
+  if (locked || phase === 'STOPPING' || phase === 'BLOCKED') return { start: false, stop: false, restart: false }
   if (phase === 'READY' || phase === 'DEGRADED') return { start: false, stop: true, restart: true }
   if (phase === 'STARTING') return { start: false, stop: true, restart: false }
   return { start: true, stop: false, restart: false }
+}
+
+async function servicePreflight(name: ServiceName, useCache = true): Promise<ServicePreflight | undefined> {
+  if (name !== 'index-tts' && name !== 'xiaozhi-server') return undefined
+  const cached = preflightCache.get(name)
+  if (useCache && cached && cached.expiresAt > Date.now()) return cached.result
+  const result = await run('/root/xiaozhi-autodl/bin/service-preflight', [name, '--json'], 4_000)
+  try {
+    const parsed = JSON.parse(result.stdout.trim()) as ServicePreflight
+    if (!parsed || typeof parsed.ok !== 'boolean' || typeof parsed.reason !== 'string') return undefined
+    preflightCache.set(name, { expiresAt: Date.now() + 4_000, result: parsed })
+    return parsed
+  } catch {
+    return undefined
+  }
 }
 
 async function processUsage(pid?: number): Promise<{ cpu?: number; memory?: number; uptime?: number }> {
@@ -152,9 +177,10 @@ export async function listServices() {
   const supervisor = await supervisorStatus()
   return Promise.all((Object.entries(SERVICES) as [ServiceName, typeof SERVICES[ServiceName]][]).map(async ([name, config]) => {
     const systemName = !config.supervisor ? name as 'mysql' | 'redis' : undefined
-    const [listening, nativeHealthy] = await Promise.all([
+    const [listening, nativeHealthy, preflight] = await Promise.all([
       portOpen(config.port),
       systemName ? systemServiceHealthy(systemName) : Promise.resolve(false),
+      servicePreflight(name),
     ])
     const processState = config.supervisor ? supervisor.get(name) : undefined
     const appHealth = systemName
@@ -163,18 +189,23 @@ export async function listServices() {
     const pid = processState?.pid || (systemName ? await systemServicePid(systemName) : undefined)
     const usage = await processUsage(pid)
     const activeAction = activeActions.get(name)
+    const blocked = !listening && !pid && preflight && !preflight.ok ? preflight : undefined
     const rawState = activeAction === 'stop'
       ? 'STOPPING'
       : activeAction === 'start' || activeAction === 'restart'
         ? 'STARTING'
-        : config.supervisor ? (processState?.state || 'NOT_MANAGED') : (nativeHealthy || listening || pid ? 'RUNNING' : 'STOPPED')
+        : blocked
+          ? 'BLOCKED'
+          : config.supervisor ? (processState?.state || 'NOT_MANAGED') : (nativeHealthy || listening || pid ? 'RUNNING' : 'STOPPED')
     const phase: ServicePhase = rawState === 'STOPPING'
       ? 'STOPPING'
       : rawState === 'STARTING'
         ? 'STARTING'
-        : appHealth.ok && listening
-          ? 'READY'
-          : listening || Boolean(pid)
+        : rawState === 'BLOCKED'
+          ? 'BLOCKED'
+          : appHealth.ok && listening
+            ? 'READY'
+            : listening || Boolean(pid)
           ? 'DEGRADED'
           : rawState === 'FATAL' || rawState === 'BACKOFF' || rawState === 'EXITED'
             ? 'FAILED'
@@ -190,6 +221,7 @@ export async function listServices() {
       state: rawState,
       phase,
       detail: processState?.detail || '',
+      blocker: blocked,
       pid,
       ...usage,
       listening,
@@ -215,6 +247,10 @@ async function performServiceAction(name: ServiceName, action: ServiceAction) {
       throw new ServiceOperationConflict(`${config.label} 当前未运行，请使用启动`)
     }
     if (action === 'restart' && state === 'STARTING') throw new ServiceOperationConflict(`${config.label} 正在启动，请等待就绪或先停止`)
+    if (action === 'start') {
+      const preflight = await servicePreflight(name, false)
+      if (preflight && !preflight.ok) throw new ServiceOperationConflict(preflight.reason)
+    }
   } else {
     const running = await systemServiceRunning(name as 'mysql' | 'redis')
     if (action === 'start' && running) return { message: `${config.label} 已经在运行` }

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/bin/python3 /root/xiaozhi-autodl/scripts/resource_preflight.py "$@"

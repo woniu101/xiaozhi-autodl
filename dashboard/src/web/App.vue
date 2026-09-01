@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 
-type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'STOPPED' | 'FAILED'
+type ServicePhase = 'READY' | 'STARTING' | 'STOPPING' | 'DEGRADED' | 'BLOCKED' | 'STOPPED' | 'FAILED'
 type Service = {
   name: string
   label: string
@@ -22,6 +22,7 @@ type Service = {
   lastError?: string
   activeAction?: 'start' | 'stop' | 'restart'
   allowedActions?: { start: boolean; stop: boolean; restart: boolean }
+  blocker?: { kind?: 'resource' | 'dependency'; reason: string; checkedAt: string }
 }
 type BatchStep = {
   service: string
@@ -180,10 +181,11 @@ const services = computed<Service[]>(() => [...(overview.value?.services || [])]
 }))
 const operation = computed<BatchOperation | undefined>(() => overview.value?.operation)
 const serviceHealth = computed(() => {
-  const counts = { ready: 0, starting: 0, stopping: 0, degraded: 0, stopped: 0, failed: 0 }
+  const counts = { ready: 0, starting: 0, stopping: 0, degraded: 0, blocked: 0, stopped: 0, failed: 0 }
   for (const service of services.value) counts[service.phase.toLowerCase() as keyof typeof counts]++
   const tone = counts.failed ? 'failed'
     : counts.degraded ? 'degraded'
+      : counts.blocked ? 'blocked'
       : counts.starting ? 'starting'
         : counts.stopping ? 'stopping'
         : counts.stopped ? 'stopped'
@@ -191,6 +193,7 @@ const serviceHealth = computed(() => {
   const details = [
     counts.failed ? `${counts.failed}项失败` : '',
     counts.degraded ? `${counts.degraded}项异常` : '',
+    counts.blocked ? `${counts.blocked}项受资源或依赖限制` : '',
     counts.starting ? `${counts.starting}项启动中` : '',
     counts.stopping ? `${counts.stopping}项停止中` : '',
     counts.stopped ? `${counts.stopped}项停止` : '',
@@ -345,8 +348,14 @@ const phaseLabels: Record<ServicePhase, string> = {
   STARTING: '正在启动',
   STOPPING: '正在停止',
   DEGRADED: '等待就绪',
+  BLOCKED: '暂不启动',
   STOPPED: '已停止',
   FAILED: '启动失败',
+}
+
+function servicePhaseLabel(service: Service) {
+  if (service.phase !== 'BLOCKED') return phaseLabels[service.phase]
+  return service.blocker?.kind === 'resource' ? '资源不足，未启动' : '依赖未就绪'
 }
 
 function fmtBytes(value?: number) {
@@ -1055,7 +1064,7 @@ onBeforeUnmount(() => {
         <article v-for="service in services" :key="service.name" :class="['service-card', service.phase.toLowerCase(), { 'health-target': healthFocus && service.phase !== 'READY', 'health-dimmed': healthFocus && service.phase === 'READY' }]">
           <div class="service-head">
             <div class="service-identity"><span :class="['service-icon', service.name]">{{ service.label.slice(0, 1) }}</span><div><h3>{{ service.label }}</h3><small>端口 {{ service.port }} ｜ {{ service.pid ? `PID ${service.pid}` : '无运行进程' }}</small></div></div>
-            <span :class="['phase-badge', service.phase.toLowerCase()]"><i></i>{{ phaseLabels[service.phase] }}</span>
+            <span :class="['phase-badge', service.phase.toLowerCase()]"><i></i>{{ servicePhaseLabel(service) }}</span>
           </div>
           <div class="service-stats">
             <span><small>CPU</small><b :class="metricTone(service.cpu, 60, 85)">{{ service.cpu ?? '--' }}{{ service.cpu !== undefined ? '%' : '' }}</b></span>
@@ -1067,9 +1076,9 @@ onBeforeUnmount(() => {
               <small>{{ signal.label }}</small><b>{{ signal.value }}</b>
             </button>
           </div>
-          <div :class="['service-note', service.lastError ? 'has-error' : '']" :title="service.lastError || ''">
-            <span>{{ service.lastError ? '最近异常' : service.healthy ? '健康检查' : '当前状态' }}</span>
-            <p>{{ service.lastError || (service.healthy ? `应用探测通过${service.healthLatencyMs !== undefined ? ` · ${service.healthLatencyMs} ms` : ''}` : service.detail || '端口尚未监听') }}</p>
+          <div :class="['service-note', service.lastError && !service.blocker ? 'has-error' : '', { 'has-blocker': service.blocker }]" :title="service.blocker?.reason || service.lastError || ''">
+            <span>{{ service.blocker ? '启动门禁' : service.lastError ? '最近异常' : service.healthy ? '健康检查' : '当前状态' }}</span>
+            <p>{{ service.blocker?.reason || service.lastError || (service.healthy ? `应用探测通过${service.healthLatencyMs !== undefined ? ` · ${service.healthLatencyMs} ms` : ''}` : service.detail || '端口尚未监听') }}</p>
             <small v-if="service.stability?.restartCount10m" :class="['restart-warning', { elevated: service.stability.restartCount10m >= 2 }]" title="包含人工启动、人工重启和异常拉起">↻ 10 分钟内启动/重启 {{ service.stability.restartCount10m }} 次</small>
           </div>
           <div class="service-actions">

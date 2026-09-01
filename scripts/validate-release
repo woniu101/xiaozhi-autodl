@@ -144,11 +144,13 @@ cpu_quota=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf 'unknown')
 memory_max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || printf 'unknown')
 emit "[INFO] Cgroup CPU：$cpu_quota"
 emit "[INFO] Cgroup 内存：$memory_max"
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q '^GPU '; then
-  pass '检测到 NVIDIA GPU'
-else
-  warn '未检测到 NVIDIA GPU；Dashboard 可运行，IndexTTS 完整验收需 GPU 实例'
-fi
+for heavy_service in index-tts xiaozhi-server; do
+  if preflight_result=$("$root/bin/service-preflight" "$heavy_service" --resources-only 2>&1); then
+    pass "$heavy_service：$preflight_result"
+  else
+    warn "$heavy_service：$preflight_result"
+  fi
+done
 
 system_free=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
 data_free=$(df -B1 --output=avail "$XIAOZHI_DATA_MOUNT" | tail -1 | tr -d ' ')
